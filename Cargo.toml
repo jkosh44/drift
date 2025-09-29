@@ -4,3 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+loom = "0.7.2"
+madsim = "0.2.31"
+thiserror = "2.0.12"
+turmoil = "0.6.6"
+tokio = "1.45.1"
+
+[features]
+turmoil = []
+
+[build]
+rustdocflags = ["-D", "warnings"]
