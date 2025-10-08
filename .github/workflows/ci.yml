@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust-ci:
+    name: Build, Lint, and Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+          cache: true
+
+      - name: Show tool versions
+        run: |
+          rustc -Vv
+          cargo -V
+
+      - name: Rustfmt (style check)
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (lint, deny warnings)
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Build (all targets)
+        run: cargo build --workspace --all-targets --all-features --verbose
+
+      - name: Test (all features and targets)
+        run: cargo test --workspace --all-features --all-targets --verbose
