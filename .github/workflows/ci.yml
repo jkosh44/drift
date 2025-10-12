@@ -34,6 +34,9 @@ jobs:
       - name: Clippy (lint, deny warnings)
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+      - name: Docs
+        run: cargo doc --no-deps --workspace --all-features --verbose
+
       - name: Build (all targets)
         run: cargo build --workspace --all-targets --all-features --verbose
 
