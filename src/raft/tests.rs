@@ -1,10 +1,12 @@
 use std::collections::BTreeSet;
 
+use proptest_derive::Arbitrary;
+
 use super::*;
 use crate::message::*;
 use crate::state::*;
 
-#[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq)]
+#[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq, Arbitrary)]
 struct Cmd(i32);
 impl Command for Cmd {}
 
@@ -969,4 +971,121 @@ fn no_commit_prev_term() {
     assert_eq!(leader.node_state.commit_index, 0);
     assert_eq!(leader.node_state.last_applied, 0);
     assert_eq!(leader.state_machine.applied, Vec::new());
+}
+
+#[cfg(test)]
+mod prop_sm {
+    //! Property-based state-machine tests (single-node).
+
+    use proptest::prelude::*;
+    use proptest::test_runner::TestCaseResult;
+
+    use super::*;
+
+    /// A minimal model to carry expectations across steps (single-node).
+    #[derive(Clone, Debug, Default)]
+    struct Model {
+        last_term: Term,
+        last_commit_index: Index,
+        last_applied_index: Index,
+    }
+
+    // System Under Test wrapper.
+    struct Sut<const N: usize> {
+        node: RaftCore<N, Cmd, TestStateMachine, TestStorage>,
+    }
+
+    impl<const N: usize> Sut<N> {
+        fn new(node_id: NodeId) -> Self {
+            Self {
+                node: new_node::<N>(node_id),
+            }
+        }
+
+        fn check_invariants(&self, model: &Model) -> TestCaseResult {
+            // Term monotonicity.
+            prop_assert!(
+                *self.node.current_term() >= model.last_term,
+                "current term, {}, decreased from last term, {}",
+                self.node.current_term(),
+                model.last_term,
+            );
+            // Commit monotonicity.
+            prop_assert!(
+                self.node.node_state.commit_index >= model.last_commit_index,
+                "current commit index, {}, decreased from last commit index, {}",
+                self.node.node_state.commit_index,
+                model.last_commit_index,
+            );
+            // Applied monotonicity.
+            prop_assert!(
+                self.node.node_state.last_applied >= model.last_applied_index,
+                "current applied index, {}, decreased from last applied index, {}",
+                self.node.node_state.last_applied,
+                model.last_applied_index,
+            );
+            // Commit index never exceeds last log index.
+            prop_assert!(
+                self.node.node_state.commit_index <= self.node.log_state.log.last_index(),
+                "commit index, {}, exceeds last log index, {}",
+                self.node.node_state.commit_index,
+                self.node.log_state.log.last_index(),
+            );
+            // Applied never exceeds the commit index.
+            prop_assert!(
+                self.node.node_state.last_applied <= self.node.node_state.commit_index,
+                "applied index, {}, exceeds commit index, {}",
+                self.node.node_state.last_applied,
+                self.node.node_state.commit_index,
+            );
+            // Log terms are never larger than the current term.
+            prop_assert!(
+                self.node
+                    .log_state
+                    .log
+                    .inner()
+                    .iter()
+                    .all(|log_entry| log_entry.term <= *self.node.current_term()),
+                "log contains larger term than current term, {}; {:?}",
+                self.node.current_term(),
+                self.node.log_state.log,
+            );
+            Ok(())
+        }
+    }
+
+    proptest! {
+        // Use a small number of steps to keep test time reasonable in CI.
+        #[test]
+        fn raft_single_node_state_machine(ops in prop::collection::vec(any::<Message<Cmd>>(), 256)) {
+            let mut sut = Sut::<3>::new(1);
+            let mut model = Model::default();
+            for msg in ops.into_iter() {
+                // Execute operation on SUT. We ignore returned outgoing messages; we only assert invariants.
+                let (expect_ok, apply) = match msg {
+                    Message::AppendEntriesRequest(_)
+                    | Message::AppendEntriesResponse(_)
+                    | Message::VoteRequest(_)
+                    | Message::VoteResponse(_) => (true, true),
+                    Message::Command(_) => (false, true),
+                    Message::BecomeCandidate => (true, sut.node.role.role() == Role::Follower),
+                };
+
+                if apply {
+                    let res = sut.node.handle_message(msg);
+                    if expect_ok {
+                        prop_assert!(res.is_ok());
+                    }
+                }
+
+                // Check invariants after each step.
+                sut.check_invariants(&model)?;
+
+                // Update model.
+                model.last_term = *sut.node.current_term();
+                model.last_commit_index = sut.node.node_state.commit_index;
+                model.last_applied_index = sut.node.node_state.last_applied;
+            }
+        }
+    }
 }
