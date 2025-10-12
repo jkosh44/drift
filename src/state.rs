@@ -4,9 +4,12 @@ use std::fmt::Debug;
 use std::num::NonZeroU64;
 use std::ops::{Deref, RangeFrom};
 
+use proptest::prelude::{Arbitrary, BoxedStrategy, Strategy, any};
+use proptest_derive::Arbitrary;
+
 macro_rules! wrapper_type {
     ($wrapper:ident, $inner:ty, $($traits:ident),*) => {
-        #[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq, $($traits,)*)]
+        #[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq, Arbitrary, $($traits,)*)]
         pub(crate) struct $wrapper($inner);
 
         impl Deref for $wrapper {
@@ -209,4 +212,19 @@ impl<const N: usize> LeaderState<N> {
             match_index: [0; N],
         }
     }
+}
+
+impl<C: Command + Arbitrary> Arbitrary for LogEntry<C>
+where
+    <C as Arbitrary>::Strategy: 'static,
+{
+    type Parameters = Term;
+
+    fn arbitrary_with(max_term: Self::Parameters) -> Self::Strategy {
+        (0..=max_term, any::<C>())
+            .prop_map(|(term, command)| LogEntry { term, command })
+            .boxed()
+    }
+
+    type Strategy = BoxedStrategy<Self>;
 }
