@@ -23,12 +23,12 @@ impl StateMachine<Cmd> for TestStateMachine {
 #[derive(Clone, Default)]
 pub(crate) struct TestStorage;
 impl Storage<Cmd> for TestStorage {
-    fn persist_state(
-        _current_term: Option<Term>,
-        _voted_for: Option<Option<NodeId>>,
-        _log: &[Cmd],
-    ) {
+    fn read_state(&self) -> Option<LogState<Cmd>> {
+        None
     }
+    fn persist_metadata(&self, _current_term: Term, _voted_for: Option<NodeId>) {}
+    fn extend_log(&self, _log: &[LogEntry<Cmd>]) {}
+    fn truncate_log(&self, _start: NonZeroIndex) {}
 }
 
 fn new_node<const N: usize>(id: NodeId) -> RaftCore<N, Cmd, TestStateMachine, TestStorage> {
@@ -49,7 +49,7 @@ fn append_entries_request_rejects_lower_term() {
     let node_id = 1;
     let node_term = 5;
     let mut node = new_node::<N>(node_id);
-    node.log_state.set_term(node_term);
+    node.set_term(node_term);
 
     let leader_id = 0;
     let req = AppendEntriesRequest {
@@ -86,7 +86,7 @@ fn append_entries_request_rejects_missing_or_mismatch() {
     let node_id = 2;
     let node_term = 2;
     let mut node = new_node::<N>(node_id);
-    node.log_state.set_term(node_term);
+    node.set_term(node_term);
 
     {
         // Missing prev log.
@@ -123,7 +123,7 @@ fn append_entries_request_rejects_missing_or_mismatch() {
         let leader_id = 0;
         // index 1, term 3.
         let log_term = 3;
-        node.log_state.log.push(log_entry(log_term, 10));
+        node.push_log(log_entry(log_term, 10));
         let req = AppendEntriesRequest {
             term: log_term,
             leader_id,
@@ -161,7 +161,7 @@ fn append_entries_request_same_term_makes_candidate_follower() {
     let node_id = 0;
     let node_term = 1;
     let mut node = new_node::<N>(node_id);
-    node.log_state.set_term(node_term);
+    node.set_term(node_term);
     node.role = RoleState::Candidate { votes: 0 };
 
     // Receiving AppendEntries with the same term should convert to follower and accept.
@@ -203,11 +203,9 @@ fn append_entries_request_conflict_truncate_append_commit_apply() {
     let node_id = 1;
     let node_term = 3;
     let mut node = new_node::<N>(node_id);
-    node.log_state.set_term(node_term);
+    node.set_term(node_term);
     // Existing log: [(t1, 1), (t2, 2), (t3, 3)].
-    node.log_state
-        .log
-        .extend([log_entry(1, 1), log_entry(2, 2), log_entry(3, 3)]);
+    node.extend_log([log_entry(1, 1), log_entry(2, 2), log_entry(3, 3)]);
 
     // Leader sends entries conflicting at index 2, with two new entries.
     let leader_id = 0;
@@ -239,9 +237,9 @@ fn append_entries_request_conflict_truncate_append_commit_apply() {
     assert_eq!(next_index, Some(NonZeroIndex::new(4).unwrap()));
 
     // Log should be: [(t1, 1), (t3, 20), (t3, 21)].
-    assert_eq!(node.log_state.log.last_index(), 3);
+    assert_eq!(node.log_state.log().last_index(), 3);
     assert_eq!(
-        node.log_state.log.inner(),
+        node.log_state.log().inner(),
         &[log_entry(1, 1), log_entry(3, 20), log_entry(3, 21)]
     );
 
@@ -258,15 +256,15 @@ fn append_entries_response_failure_retries_and_decrements() {
     let node_id = 0;
     let node_term = 10;
     let mut node = new_node::<N>(node_id);
-    node.log_state.set_term(node_term);
+    node.set_term(node_term);
 
     // Add one entry so prev_log_index lookups are valid.
     let log_term = 9;
-    node.log_state.log.push(log_entry(log_term, 1));
+    node.push_log(log_entry(log_term, 1));
 
     // Become leader manually.
     // Set follower 1 next_index to 3 (so prev_log_index = 2).
-    let mut leader_state = LeaderState::new(node.log_state.log.last_index());
+    let mut leader_state = LeaderState::new(node.log_state.log().last_index());
     leader_state.next_index[1] = NonZeroIndex::new(3).unwrap();
     node.role = RoleState::Leader { leader_state };
 
@@ -319,13 +317,13 @@ fn append_entries_response_no_decrement_below_one_but_retries() {
     let node_id = 0;
     let node_term = 2;
     let mut node = new_node::<N>(node_id);
-    node.log_state.set_term(node_term);
+    node.set_term(node_term);
 
     let log_term = 2;
-    node.log_state.log.push(log_entry(log_term, 1));
+    node.push_log(log_entry(log_term, 1));
 
     // Force follower next_index to 1.
-    let mut leader_state = LeaderState::new(node.log_state.log.last_index());
+    let mut leader_state = LeaderState::new(node.log_state.log().last_index());
     leader_state.next_index[1] = NonZeroIndex::new(1).unwrap();
     node.role = RoleState::Leader { leader_state };
 
@@ -355,7 +353,7 @@ fn append_entries_response_no_decrement_below_one_but_retries() {
     assert_eq!(leader_id, node_id);
     assert_eq!(prev_log_index, 0);
     assert_eq!(prev_log_term, Term::MIN);
-    assert_eq!(entries, node.log_state.log.inner().to_vec());
+    assert_eq!(entries, node.log_state.log().inner().to_vec());
     assert_eq!(leader_commit, node.node_state.commit_index);
 
     let RoleState::Leader {
@@ -377,13 +375,13 @@ fn append_entries_response_success_updates_and_commits() {
     let node_id = 0;
     let node_term = 7;
     let mut leader = new_node::<N>(node_id);
-    leader.log_state.set_term(node_term);
+    leader.set_term(node_term);
     leader.role = RoleState::Leader {
         leader_state: LeaderState::new(0),
     };
 
     // Leader has one entry at term 7.
-    leader.log_state.log.push(log_entry(node_term, 42));
+    leader.push_log(log_entry(node_term, 42));
 
     // Followers report success with next_index = 2.
     // First follower updates match_index to 1; not yet majority.
@@ -424,7 +422,7 @@ fn append_entries_response_success_updates_and_commits() {
 fn append_entries_response_ignored_when_not_leader() {
     const N: usize = 3;
     let mut node = new_node::<N>(0);
-    node.log_state.set_term(1);
+    node.set_term(1);
     let role = node.role.clone();
     let log_state = node.log_state.clone();
     let node_state = node.node_state.clone();
@@ -473,7 +471,7 @@ fn vote_request_rejected_lower_term() {
     const N: usize = 3;
     let node_term = 2;
     let mut node = new_node::<N>(3);
-    node.log_state.set_term(node_term);
+    node.set_term(node_term);
 
     // Lower term rejected.
     let candidate_id = 1;
@@ -499,8 +497,8 @@ fn vote_request_rejected_already_voted() {
     const N: usize = 3;
     let node_term = 3;
     let mut node = new_node::<N>(3);
-    node.log_state.set_term(node_term);
-    node.log_state.voted_for = Some(0);
+    node.set_term(node_term);
+    node.set_voted_for(0);
 
     let candidate_id = 2;
     let req = VoteRequest {
@@ -526,8 +524,8 @@ fn vote_request_rejected_not_up_to_date_by_term() {
     let node_term = 10;
     let last_term = 6;
     let mut node = new_node::<N>(3);
-    node.log_state.set_term(node_term);
-    node.log_state.log.push(log_entry(last_term, 1));
+    node.set_term(node_term);
+    node.push_log(log_entry(last_term, 1));
 
     let candidate_id = 4;
     let req = VoteRequest {
@@ -544,7 +542,7 @@ fn vote_request_rejected_not_up_to_date_by_term() {
     assert_eq!(resp_node_id, candidate_id);
     assert_eq!(term, node_term);
     assert!(!vote_granted);
-    assert_eq!(node.log_state.voted_for, None);
+    assert_eq!(*node.log_state.voted_for(), None);
 }
 
 // Reject VoteRequest if a candidate's log has a lower last log index.
@@ -554,8 +552,8 @@ fn vote_request_rejected_not_up_to_date_by_index() {
     let node_term = 10;
     let last_term = 6;
     let mut node = new_node::<N>(3);
-    node.log_state.set_term(node_term);
-    node.log_state.log.push(log_entry(last_term, 1));
+    node.set_term(node_term);
+    node.push_log(log_entry(last_term, 1));
 
     let candidate_id = 4;
     let req = VoteRequest {
@@ -572,7 +570,7 @@ fn vote_request_rejected_not_up_to_date_by_index() {
     assert_eq!(resp_node_id, candidate_id);
     assert_eq!(term, node_term);
     assert!(!vote_granted);
-    assert_eq!(node.log_state.voted_for, None);
+    assert_eq!(*node.log_state.voted_for(), None);
 }
 
 // Grant VoteRequest with higher terms.
@@ -580,7 +578,7 @@ fn vote_request_rejected_not_up_to_date_by_index() {
 fn vote_request_granted_higher_term() {
     const N: usize = 3;
     let mut node = new_node::<N>(3);
-    node.log_state.set_term(2);
+    node.set_term(2);
 
     let candidate_id = 1;
     let vote_term = 3;
@@ -603,7 +601,7 @@ fn vote_request_granted_higher_term() {
         assert_eq!(term, vote_term);
         assert!(vote_granted);
     }
-    assert_eq!(node.log_state.voted_for, Some(candidate_id));
+    assert_eq!(*node.log_state.voted_for(), Some(candidate_id));
 
     // Grant again to the same candidate.
     {
@@ -615,7 +613,7 @@ fn vote_request_granted_higher_term() {
         assert_eq!(term, vote_term);
         assert!(vote_granted);
     }
-    assert_eq!(node.log_state.voted_for, Some(candidate_id));
+    assert_eq!(*node.log_state.voted_for(), Some(candidate_id));
 }
 
 // Grant VoteRequest if the candidate's log has a larger last log term.
@@ -625,8 +623,8 @@ fn vote_request_granted_same_term_up_to_date_by_term() {
     let node_term = 10;
     let last_term = 6;
     let mut node = new_node::<N>(3);
-    node.log_state.set_term(node_term);
-    node.log_state.log.push(log_entry(last_term, 1));
+    node.set_term(node_term);
+    node.push_log(log_entry(last_term, 1));
 
     let candidate_id = 4;
     let req = VoteRequest {
@@ -643,7 +641,7 @@ fn vote_request_granted_same_term_up_to_date_by_term() {
     assert_eq!(resp_node_id, candidate_id);
     assert_eq!(term, node_term);
     assert!(vote_granted);
-    assert_eq!(node.log_state.voted_for, Some(candidate_id));
+    assert_eq!(*node.log_state.voted_for(), Some(candidate_id));
 }
 
 // Grant VoteRequest if the candidate's log has a larger last log index.
@@ -653,8 +651,8 @@ fn vote_request_granted_same_term_up_to_date_by_index() {
     let node_term = 10;
     let last_term = 6;
     let mut node = new_node::<N>(3);
-    node.log_state.set_term(node_term);
-    node.log_state.log.push(log_entry(last_term, 1));
+    node.set_term(node_term);
+    node.push_log(log_entry(last_term, 1));
 
     let candidate_id = 4;
     let req = VoteRequest {
@@ -671,7 +669,7 @@ fn vote_request_granted_same_term_up_to_date_by_index() {
     assert_eq!(resp_node_id, candidate_id);
     assert_eq!(term, node_term);
     assert!(vote_granted);
-    assert_eq!(node.log_state.voted_for, Some(candidate_id));
+    assert_eq!(*node.log_state.voted_for(), Some(candidate_id));
 }
 
 // Rejected VoteResponse is ignored if it's in the same term.
@@ -680,7 +678,7 @@ fn vote_response_rejected_same_term() {
     const N: usize = 3;
     let node_term = 4;
     let mut node = new_node::<N>(0);
-    node.log_state.set_term(node_term);
+    node.set_term(node_term);
 
     let role = RoleState::Candidate { votes: 1 };
     node.role = role.clone();
@@ -701,7 +699,7 @@ fn vote_response_rejected_later_term() {
     const N: usize = 3;
     let node_term = 4;
     let mut node = new_node::<N>(0);
-    node.log_state.set_term(node_term);
+    node.set_term(node_term);
 
     let role = RoleState::Candidate { votes: 1 };
     node.role = role.clone();
@@ -741,9 +739,7 @@ fn vote_response_granted_promotion() {
     const N: usize = 3;
     let mut node = new_node::<N>(3);
     node.role = RoleState::Candidate { votes: 1 };
-    node.log_state
-        .log
-        .extend([log_entry(1, 1), log_entry(2, 2)]);
+    node.extend_log([log_entry(1, 1), log_entry(2, 2)]);
 
     let resp = VoteResponse {
         term: *node.current_term(),
@@ -769,7 +765,7 @@ fn vote_response_ignored() {
     const N: usize = 3;
     let node_term = 4;
     let mut node = new_node::<N>(0);
-    node.log_state.set_term(node_term);
+    node.set_term(node_term);
 
     // As a follower, ignore.
     {
@@ -807,8 +803,8 @@ fn become_candidate_broadcasts_votes() {
     let node_id = 1;
     let node_term = 1;
     let mut node = new_node::<N>(node_id);
-    node.log_state.set_term(node_term);
-    node.log_state.log.push(log_entry(node_term, 0));
+    node.set_term(node_term);
+    node.push_log(log_entry(node_term, 0));
 
     let out = node.handle_message(Message::BecomeCandidate).unwrap();
     // Two peers (0 and 2) receive VoteRequest.
@@ -865,8 +861,8 @@ fn command_leader_sends_append_entries() {
         match_index: [0; N],
     };
     let mut node = new_node::<N>(node_id);
-    node.log_state.set_term(node_term);
-    node.log_state.log.extend(entries.clone());
+    node.set_term(node_term);
+    node.extend_log(entries.clone());
     node.role = RoleState::Leader { leader_state };
 
     let cmd = Cmd(99);
@@ -918,7 +914,7 @@ fn higher_term_resets_and_clears_vote() {
     const N: usize = 3;
     let mut node = new_node::<N>(1);
     let _ = node.handle_message(Message::BecomeCandidate).unwrap();
-    node.log_state.voted_for = Some(42);
+    node.set_voted_for(42);
 
     // Receive higher term AppendEntriesResponse (could be any).
     let _ = node
@@ -930,7 +926,7 @@ fn higher_term_resets_and_clears_vote() {
         }))
         .unwrap();
     assert_eq!(node.role.role(), Role::Follower);
-    assert_eq!(node.log_state.voted_for, None);
+    assert_eq!(*node.log_state.voted_for(), None);
 }
 
 // Majority replication does not commit entries from a prior term.
@@ -939,12 +935,12 @@ fn no_commit_prev_term() {
     const N: usize = 3;
     let mut leader = new_node::<N>(0);
     // Current term 7, but the log entry is from term 6.
-    leader.log_state.set_term(7);
+    leader.set_term(7);
     leader.role = RoleState::Leader {
         leader_state: LeaderState::new(0),
     };
     // index 1, term 6.
-    leader.log_state.log.push(log_entry(6, 5));
+    leader.push_log(log_entry(6, 5));
 
     let resp1 = AppendEntriesResponse {
         term: 7,

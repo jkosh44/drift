@@ -7,6 +7,8 @@ use std::ops::{Deref, RangeFrom};
 #[cfg(test)]
 use proptest_derive::Arbitrary;
 
+use crate::storage::Storage;
+
 macro_rules! wrapper_type {
     ($wrapper:ident, $inner:ty, $($traits:ident),*) => {
         #[cfg_attr(test, derive(Arbitrary))]
@@ -107,10 +109,6 @@ impl<C: Command> Log<C> {
         self.log.extend(entries);
     }
 
-    pub(crate) fn push(&mut self, entry: LogEntry<C>) {
-        self.extend([entry])
-    }
-
     /// The index of the next log that will be inserted.
     pub(crate) fn next_index(&self) -> NonZeroIndex {
         NonZeroIndex::from_idx(self.log.len())
@@ -144,39 +142,80 @@ impl<C: Command> std::ops::Index<RangeFrom<NonZeroIndex>> for Log<C> {
     }
 }
 
-// TODO: All changes to this should be persisted.
 /// Persistent state on all servers. Updated on stable storage before responding to RPCs.
 #[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq)]
 pub(crate) struct LogState<C: Command> {
     /// Latest term server has seen, increases monotonically.
     current_term: Term,
     /// Candidate ID that received vote in current term, if one exists.
-    pub(crate) voted_for: Option<NodeId>,
+    voted_for: Option<NodeId>,
     /// Log entries; each entry contains command for state machine, and term when entry was
     /// received by leader. First index is 1.
-    pub(crate) log: Log<C>,
+    log: Log<C>,
 }
 
 impl<C: Command> LogState<C> {
-    pub(crate) fn new(current_term: Term, voted_for: Option<NodeId>, log: Log<C>) -> Self {
-        Self {
-            current_term,
-            voted_for,
-            log,
-        }
+    pub(crate) fn new<S: Storage<C>>(storage: &S) -> Self {
+        storage.read_state().unwrap_or_else(|| Self {
+            current_term: Term::MIN,
+            voted_for: None,
+            log: Log::new(),
+        })
     }
 
     pub(crate) fn current_term(&self) -> &Term {
         &self.current_term
     }
 
-    pub(crate) fn set_term(&mut self, term: Term) {
-        self.voted_for = None;
+    pub(crate) fn set_term<S: Storage<C>>(&mut self, term: Term, storage: &S) {
+        storage.persist_metadata(term, None);
         self.current_term = term;
+        self.voted_for = None;
     }
 
-    pub(crate) fn increment_term(&mut self) {
-        self.set_term(self.current_term + 1);
+    pub(crate) fn increment_term<S: Storage<C>>(&mut self, storage: &S) {
+        self.set_term(self.current_term + 1, storage);
+    }
+
+    pub(crate) fn voted_for(&self) -> &Option<NodeId> {
+        &self.voted_for
+    }
+
+    pub(crate) fn set_voted_for<S: Storage<C>>(&mut self, node_id: NodeId, storage: &S) {
+        storage.persist_metadata(self.current_term, Some(node_id));
+        self.voted_for = Some(node_id);
+    }
+
+    pub(crate) fn log(&self) -> &Log<C> {
+        &self.log
+    }
+
+    pub(crate) fn truncate_log<S: Storage<C>>(&mut self, start: NonZeroIndex, storage: &S) {
+        storage.truncate_log(start);
+        self.log.truncate(start);
+    }
+
+    pub(crate) fn extend_log<S: Storage<C>>(
+        &mut self,
+        entries: impl IntoIterator<Item = LogEntry<C>>,
+        storage: &S,
+    ) {
+        let entries: Vec<_> = entries.into_iter().collect();
+        storage.extend_log(&entries);
+        self.log.extend(entries);
+    }
+
+    pub(crate) fn push_log<S: Storage<C>>(&mut self, entry: LogEntry<C>, storage: &S) {
+        self.extend_log([entry], storage)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_parts(current_term: Term, voted_for: Option<NodeId>, log: Log<C>) -> Self {
+        Self {
+            current_term,
+            voted_for,
+            log,
+        }
     }
 }
 

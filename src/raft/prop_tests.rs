@@ -6,6 +6,7 @@ use proptest::test_runner::TestCaseResult;
 use super::*;
 use crate::raft::tests::{Cmd, TestStateMachine, TestStorage};
 use crate::state::{Index, Log};
+use crate::storage::Storage;
 
 /// A minimal model to carry expectations across steps (single-node).
 #[derive(Clone, Debug)]
@@ -52,10 +53,10 @@ fn check_invariants<const N: usize>(
     );
     // Commit index never exceeds last log index.
     prop_assert!(
-        node.node_state.commit_index <= node.log_state.log.last_index(),
+        node.node_state.commit_index <= node.log_state.log().last_index(),
         "commit index, {}, exceeds last log index, {}",
         node.node_state.commit_index,
-        node.log_state.log.last_index(),
+        node.log_state.log().last_index(),
     );
     // Applied never exceeds the commit index.
     prop_assert!(
@@ -67,22 +68,22 @@ fn check_invariants<const N: usize>(
     // Log terms are never larger than the current term.
     prop_assert!(
         node.log_state
-            .log
+            .log()
             .inner()
             .iter()
             .all(|log_entry| log_entry.term <= *node.current_term()),
         "log contains larger term than current term, {}; {:?}",
         node.current_term(),
-        node.log_state.log,
+        node.log_state.log(),
     );
     // Log sorted by term.
     prop_assert!(
         node.log_state
-            .log
+            .log()
             .inner()
             .is_sorted_by_key(|log_entry| log_entry.term),
         "log should be sorted by term: {:?}",
-        node.log_state.log
+        node.log_state.log()
     );
     Ok(())
 }
@@ -99,7 +100,7 @@ impl<const N: usize> Arbitrary for TestCase<N> {
     fn arbitrary_with(_: Self::Parameters) -> Self::Strategy {
         any::<RaftCore<N, Cmd, TestStateMachine, TestStorage>>()
             .prop_flat_map(|node| {
-                let last_index = node.log_state.log.last_index();
+                let last_index = node.log_state.log().last_index();
                 let message =
                     any_with::<Message<Cmd>>((N, last_index, *node.log_state.current_term()));
                 let messages = prop::collection::vec(message, 64);
@@ -125,8 +126,8 @@ where
     fn arbitrary_with(_: Self::Parameters) -> Self::Strategy {
         (0..N, any_with::<LogState<C>>(N))
             .prop_flat_map(|(node_id, log_state)| {
-                let node_state = any_with::<NodeState>((N, log_state.log.last_index()));
-                let role = any_with::<RoleState<N>>(log_state.log.last_index());
+                let node_state = any_with::<NodeState>((N, log_state.log().last_index()));
+                let role = any_with::<RoleState<N>>(log_state.log().last_index());
                 (Just(node_id as NodeId), Just(log_state), node_state, role)
             })
             .prop_map(|(node_id, log_state, node_state, role)| RaftCore {
@@ -157,7 +158,9 @@ impl<C: Command + Arbitrary + 'static> Arbitrary for LogState<C> {
                 let log = any_with::<Log<C>>(current_term);
                 (Just(current_term), Just(voted_for), log)
             })
-            .prop_map(|(current_term, voted_for, log)| LogState::new(current_term, voted_for, log))
+            .prop_map(|(current_term, voted_for, log)| {
+                LogState::from_parts(current_term, voted_for, log)
+            })
             .boxed()
     }
 
