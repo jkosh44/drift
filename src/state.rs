@@ -4,12 +4,13 @@ use std::fmt::Debug;
 use std::num::NonZeroU64;
 use std::ops::{Deref, RangeFrom};
 
-use proptest::prelude::{Arbitrary, BoxedStrategy, Strategy, any};
+#[cfg(test)]
 use proptest_derive::Arbitrary;
 
 macro_rules! wrapper_type {
     ($wrapper:ident, $inner:ty, $($traits:ident),*) => {
-        #[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq, Arbitrary, $($traits,)*)]
+        #[cfg_attr(test, derive(Arbitrary))]
+        #[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq, $($traits,)*)]
         pub(crate) struct $wrapper($inner);
 
         impl Deref for $wrapper {
@@ -124,6 +125,13 @@ impl<C: Command> Log<C> {
     pub(crate) fn inner(&self) -> &[LogEntry<C>] {
         &self.log
     }
+
+    #[cfg(test)]
+    pub(crate) fn from_inner(log: impl IntoIterator<Item = LogEntry<C>>) -> Self {
+        Self {
+            log: log.into_iter().collect(),
+        }
+    }
 }
 
 impl<C: Command> std::ops::Index<RangeFrom<NonZeroIndex>> for Log<C> {
@@ -149,12 +157,12 @@ pub(crate) struct LogState<C: Command> {
     pub(crate) log: Log<C>,
 }
 
-impl<L: Command> LogState<L> {
-    pub(crate) fn new() -> Self {
+impl<C: Command> LogState<C> {
+    pub(crate) fn new(current_term: Term, voted_for: Option<NodeId>, log: Log<C>) -> Self {
         Self {
-            current_term: 0,
-            voted_for: None,
-            log: Log::new(),
+            current_term,
+            voted_for,
+            log,
         }
     }
 
@@ -193,6 +201,40 @@ impl NodeState {
     }
 }
 
+/// The current role and role associated state of a Raft node.
+#[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq)]
+pub(crate) enum RoleState<const N: usize> {
+    Follower,
+    Candidate { votes: usize },
+    Leader { leader_state: LeaderState<N> },
+}
+
+impl<const N: usize> RoleState<N> {
+    pub(crate) fn is_candidate(&self) -> bool {
+        matches!(self, RoleState::Candidate { .. })
+    }
+
+    pub(crate) fn is_leader(&self) -> bool {
+        matches!(self, RoleState::Leader { .. })
+    }
+
+    pub(crate) fn role(&self) -> Role {
+        match self {
+            RoleState::Follower => Role::Follower,
+            RoleState::Candidate { .. } => Role::Candidate,
+            RoleState::Leader { .. } => Role::Leader,
+        }
+    }
+}
+
+/// The current role of a Raft node.
+#[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq)]
+pub(crate) enum Role {
+    Follower,
+    Candidate,
+    Leader,
+}
+
 /// Volatile state on leaders.
 #[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq)]
 pub(crate) struct LeaderState<const N: usize> {
@@ -212,19 +254,4 @@ impl<const N: usize> LeaderState<N> {
             match_index: [0; N],
         }
     }
-}
-
-impl<C: Command + Arbitrary> Arbitrary for LogEntry<C>
-where
-    <C as Arbitrary>::Strategy: 'static,
-{
-    type Parameters = Term;
-
-    fn arbitrary_with(max_term: Self::Parameters) -> Self::Strategy {
-        (0..=max_term, any::<C>())
-            .prop_map(|(term, command)| LogEntry { term, command })
-            .boxed()
-    }
-
-    type Strategy = BoxedStrategy<Self>;
 }

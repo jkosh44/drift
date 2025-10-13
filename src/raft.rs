@@ -1,35 +1,44 @@
 //! This module contains the [Raft](https://raft.github.io/raft.pdf) consensus algorithm.
 
 #[cfg(test)]
+mod prop_tests;
+#[cfg(test)]
 mod tests;
+
+use derivative::Derivative;
 
 use crate::error::Error;
 use crate::message::{
     AppendEntriesRequest, AppendEntriesResponse, Message, VoteRequest, VoteResponse,
 };
 use crate::state::{
-    Command, LeaderState, LogEntry, LogState, NodeId, NodeState, NonZeroIndex, Term,
+    Command, LeaderState, Log, LogEntry, LogState, NodeId, NodeState, NonZeroIndex, Role,
+    RoleState, Term,
 };
 
-pub trait StateMachine<C: Command> {
+pub trait StateMachine<C: Command>: Clone {
     fn apply(&mut self, entry: &C);
 }
 
 // TODO: Is this the right traits for Storage?
 #[expect(unused)]
-pub trait Storage<C: Command> {
+pub trait Storage<C: Command>: Clone {
     fn persist_state(current_term: Option<Term>, voted_for: Option<Option<NodeId>>, log: &[C]);
 }
 
 /// The deterministic parts of the Raft algorithm for a single node. Specifically, this does not
 /// contain any timers or networking code.
 #[expect(dead_code)]
+#[derive(Derivative, Clone)]
+#[derivative(Debug, PartialEq, Eq)]
 struct RaftCore<const N: usize, C: Command, SM: StateMachine<C>, S: Storage<C>> {
     node_id: NodeId,
     log_state: LogState<C>,
     node_state: NodeState,
     role: RoleState<N>,
+    #[derivative(Debug = "ignore", PartialEq = "ignore")]
     state_machine: SM,
+    #[derivative(Debug = "ignore", PartialEq = "ignore")]
     storage: S,
 }
 
@@ -38,7 +47,7 @@ impl<const N: usize, C: Command, SM: StateMachine<C>, S: Storage<C>> RaftCore<N,
     fn new(node_id: NodeId, state_machine: SM, storage: S) -> Self {
         Self {
             node_id,
-            log_state: LogState::new(),
+            log_state: LogState::new(Term::MIN, None, Log::new()),
             node_state: NodeState::new(),
             role: RoleState::Follower,
             state_machine,
@@ -482,38 +491,4 @@ impl<const N: usize, C: Command, SM: StateMachine<C>, S: Storage<C>> RaftCore<N,
     fn current_term(&self) -> &Term {
         self.log_state.current_term()
     }
-}
-
-/// The current role and role associated state of a Raft node.
-#[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq)]
-enum RoleState<const N: usize> {
-    Follower,
-    Candidate { votes: usize },
-    Leader { leader_state: LeaderState<N> },
-}
-
-impl<const C: usize> RoleState<C> {
-    fn is_candidate(&self) -> bool {
-        matches!(self, RoleState::Candidate { .. })
-    }
-
-    fn is_leader(&self) -> bool {
-        matches!(self, RoleState::Leader { .. })
-    }
-
-    fn role(&self) -> Role {
-        match self {
-            RoleState::Follower => Role::Follower,
-            RoleState::Candidate { .. } => Role::Candidate,
-            RoleState::Leader { .. } => Role::Leader,
-        }
-    }
-}
-
-/// The current role of a Raft node.
-#[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq)]
-enum Role {
-    Follower,
-    Candidate,
-    Leader,
 }
