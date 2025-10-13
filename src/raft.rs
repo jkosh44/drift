@@ -12,23 +12,17 @@ use crate::message::{
     AppendEntriesRequest, AppendEntriesResponse, Message, VoteRequest, VoteResponse,
 };
 use crate::state::{
-    Command, LeaderState, Log, LogEntry, LogState, NodeId, NodeState, NonZeroIndex, Role,
-    RoleState, Term,
+    Command, LeaderState, LogEntry, LogState, NodeId, NodeState, NonZeroIndex, Role, RoleState,
+    Term,
 };
+use crate::storage::Storage;
 
-pub trait StateMachine<C: Command>: Clone {
+pub trait StateMachine<C: Command> {
     fn apply(&mut self, entry: &C);
-}
-
-// TODO: Is this the right traits for Storage?
-#[expect(unused)]
-pub trait Storage<C: Command>: Clone {
-    fn persist_state(current_term: Option<Term>, voted_for: Option<Option<NodeId>>, log: &[C]);
 }
 
 /// The deterministic parts of the Raft algorithm for a single node. Specifically, this does not
 /// contain any timers or networking code.
-#[expect(dead_code)]
 #[derive(Derivative, Clone)]
 #[derivative(Debug, PartialEq, Eq)]
 struct RaftCore<const N: usize, C: Command, SM: StateMachine<C>, S: Storage<C>> {
@@ -47,7 +41,7 @@ impl<const N: usize, C: Command, SM: StateMachine<C>, S: Storage<C>> RaftCore<N,
     fn new(node_id: NodeId, state_machine: SM, storage: S) -> Self {
         Self {
             node_id,
-            log_state: LogState::new(Term::MIN, None, Log::new()),
+            log_state: LogState::new(&storage),
             node_state: NodeState::new(),
             role: RoleState::Follower,
             state_machine,
@@ -147,7 +141,7 @@ impl<const N: usize, C: Command, SM: StateMachine<C>, S: Storage<C>> RaftCore<N,
         //
         // Note: prev_log_index == 0 is allowed.
         if prev_log_index != 0 {
-            let Some(prev_log) = self.log_state.log.get(prev_log_index) else {
+            let Some(prev_log) = self.log_state.log().get(prev_log_index) else {
                 return failed_response();
             };
             if prev_log.term != prev_log_term {
@@ -165,20 +159,20 @@ impl<const N: usize, C: Command, SM: StateMachine<C>, S: Storage<C>> RaftCore<N,
             .expect("adding one ensures that this is not zero");
         if let Some(conflicting_idx) = entries
             .iter()
-            .zip(self.log_state.log[next_index..].iter())
+            .zip(self.log_state.log()[next_index..].iter())
             .position(|(new_entry, existing_entry)| new_entry.term != existing_entry.term)
         {
             let truncate_index = next_index
                 .checked_add(conflicting_idx as u64)
                 .expect("log index overflow")
                 .into();
-            self.log_state.log.truncate(truncate_index);
+            self.truncate_log(truncate_index);
         }
 
         // Append any new entries not already in the log.
-        let new_entries_idx = (self.log_state.log.next_index().get() - next_index.get()) as usize;
+        let new_entries_idx = (self.log_state.log().next_index().get() - next_index.get()) as usize;
         entries.drain(0..new_entries_idx);
-        self.log_state.log.extend(entries);
+        self.extend_log(entries);
 
         self.node_state.leader_id = Some(leader_id);
 
@@ -186,7 +180,7 @@ impl<const N: usize, C: Command, SM: StateMachine<C>, S: Storage<C>> RaftCore<N,
         // entry).
         if leader_commit > self.node_state.commit_index {
             self.node_state.commit_index =
-                std::cmp::min(leader_commit, self.log_state.log.last_index());
+                std::cmp::min(leader_commit, self.log_state.log().last_index());
         }
 
         self.apply_committed_entries();
@@ -195,7 +189,7 @@ impl<const N: usize, C: Command, SM: StateMachine<C>, S: Storage<C>> RaftCore<N,
             term: *self.current_term(),
             success: true,
             node_id: self.node_id,
-            next_index: Some(self.log_state.log.next_index()),
+            next_index: Some(self.log_state.log().next_index()),
         }
     }
 
@@ -247,7 +241,7 @@ impl<const N: usize, C: Command, SM: StateMachine<C>, S: Storage<C>> RaftCore<N,
         let mut match_index: Vec<_> = match_index.iter().copied().collect();
         match_index.sort_unstable();
         let new_commit_index = match_index[match_index.len() / 2];
-        if let Some(new_commit_entry) = self.log_state.log.get(new_commit_index)
+        if let Some(new_commit_entry) = self.log_state.log().get(new_commit_index)
             && new_commit_entry.term == current_term
         {
             self.node_state.commit_index =
@@ -317,11 +311,12 @@ impl<const N: usize, C: Command, SM: StateMachine<C>, S: Storage<C>> RaftCore<N,
         // the log with the later term is more up-to-date. If the logs
         // end with the same term, then whichever log is longer is
         // more up-to-date.
-        if self.log_state.voted_for.is_none() || self.log_state.voted_for == Some(candidate_id) {
-            let my_last_index = self.log_state.log.last_index();
+        if self.log_state.voted_for().is_none() || *self.log_state.voted_for() == Some(candidate_id)
+        {
+            let my_last_index = self.log_state.log().last_index();
             let my_last_term = self
                 .log_state
-                .log
+                .log()
                 .last()
                 .map(|entry| entry.term)
                 .unwrap_or(Term::MIN);
@@ -329,7 +324,7 @@ impl<const N: usize, C: Command, SM: StateMachine<C>, S: Storage<C>> RaftCore<N,
             if last_log_term > my_last_term
                 || (last_log_term == my_last_term && last_log_index >= my_last_index)
             {
-                self.log_state.voted_for = Some(candidate_id);
+                self.set_voted_for(candidate_id);
                 return VoteResponse {
                     term: *self.current_term(),
                     vote_granted: true,
@@ -360,7 +355,7 @@ impl<const N: usize, C: Command, SM: StateMachine<C>, S: Storage<C>> RaftCore<N,
             // If votes received from majority of servers: become leader.
             if *votes > N / 2 {
                 self.role = RoleState::Leader {
-                    leader_state: LeaderState::new(self.log_state.log.last_index()),
+                    leader_state: LeaderState::new(self.log_state.log().last_index()),
                 };
             }
         }
@@ -369,11 +364,11 @@ impl<const N: usize, C: Command, SM: StateMachine<C>, S: Storage<C>> RaftCore<N,
     fn become_candidate(&mut self) -> VoteRequest {
         assert_eq!(self.role.role(), Role::Follower);
         // Increment currentTerm.
-        self.log_state.increment_term();
+        self.increment_term();
         self.role = RoleState::Candidate { votes: 0 };
 
         // Vote for self.
-        self.log_state.voted_for = Some(self.node_id);
+        self.set_voted_for(self.node_id);
         self.vote_response(VoteResponse {
             term: *self.current_term(),
             vote_granted: true,
@@ -382,10 +377,10 @@ impl<const N: usize, C: Command, SM: StateMachine<C>, S: Storage<C>> RaftCore<N,
         VoteRequest {
             term: *self.current_term(),
             candidate_id: self.node_id,
-            last_log_index: self.log_state.log.last_index(),
+            last_log_index: self.log_state.log().last_index(),
             last_log_term: self
                 .log_state
-                .log
+                .log()
                 .last()
                 .map(|entry| entry.term)
                 .unwrap_or(Term::MIN),
@@ -400,7 +395,7 @@ impl<const N: usize, C: Command, SM: StateMachine<C>, S: Storage<C>> RaftCore<N,
             return Err(self.node_state.leader_id);
         }
 
-        self.log_state.log.push(LogEntry {
+        self.push_log(LogEntry {
             term: *self.current_term(),
             command,
         });
@@ -420,7 +415,7 @@ impl<const N: usize, C: Command, SM: StateMachine<C>, S: Storage<C>> RaftCore<N,
             term: *self.current_term(),
             success: true,
             node_id: self.node_id,
-            next_index: Some(self.log_state.log.next_index()),
+            next_index: Some(self.log_state.log().next_index()),
         });
         assert_eq!(
             result, None,
@@ -449,12 +444,12 @@ impl<const N: usize, C: Command, SM: StateMachine<C>, S: Storage<C>> RaftCore<N,
         let prev_log_index = next_index.get() - 1;
         let prev_log_term = self
             .log_state
-            .log
+            .log()
             .get(prev_log_index)
             .map(|entry| entry.term)
             .unwrap_or(Term::MIN);
         // TODO: Try and avoid these clones.
-        let entries = self.log_state.log[next_index..].to_vec();
+        let entries = self.log_state.log()[next_index..].to_vec();
         AppendEntriesRequest {
             term: *self.current_term(),
             leader_id: self.node_id,
@@ -471,7 +466,7 @@ impl<const N: usize, C: Command, SM: StateMachine<C>, S: Storage<C>> RaftCore<N,
         while self.node_state.commit_index > self.node_state.last_applied {
             let entry = self
                 .log_state
-                .log
+                .log()
                 .get(self.node_state.last_applied + 1)
                 .expect("cannot commit a non-existent entry");
             self.state_machine.apply(&entry.command);
@@ -483,12 +478,42 @@ impl<const N: usize, C: Command, SM: StateMachine<C>, S: Storage<C>> RaftCore<N,
     /// set currentTerm = T, convert to follower (§5.1).
     fn process_term(&mut self, term: Term) {
         if term > *self.current_term() {
-            self.log_state.set_term(term);
+            self.set_term(term);
             self.role = RoleState::Follower;
         }
     }
 
     fn current_term(&self) -> &Term {
         self.log_state.current_term()
+    }
+
+    fn set_term(&mut self, term: Term) {
+        self.log_state.set_term(term, &self.storage);
+    }
+
+    fn increment_term(&mut self) {
+        self.log_state.increment_term(&self.storage);
+    }
+
+    fn set_voted_for(&mut self, node_id: NodeId) {
+        self.log_state.set_voted_for(node_id, &self.storage);
+    }
+
+    fn truncate_log(&mut self, start: NonZeroIndex) {
+        assert!(
+            self.node_state.commit_index < start.get(),
+            "cannot truncate committed entries; commit index: {}, truncate index: {}",
+            self.node_state.commit_index,
+            start.get()
+        );
+        self.log_state.truncate_log(start, &self.storage);
+    }
+
+    fn extend_log(&mut self, entries: impl IntoIterator<Item = LogEntry<C>>) {
+        self.log_state.extend_log(entries, &self.storage);
+    }
+
+    fn push_log(&mut self, entry: LogEntry<C>) {
+        self.log_state.push_log(entry, &self.storage);
     }
 }
