@@ -13,7 +13,7 @@ macro_rules! wrapper_type {
     ($wrapper:ident, $inner:ty, $($traits:ident),*) => {
         #[cfg_attr(test, derive(Arbitrary))]
         #[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq, $($traits,)*)]
-        pub(crate) struct $wrapper($inner);
+        pub struct $wrapper($inner);
 
         impl Deref for $wrapper {
             type Target = $inner;
@@ -37,8 +37,10 @@ macro_rules! wrapper_type {
     };
 }
 
-pub(crate) type Term = u64;
-pub(crate) type NodeId = u64;
+/// New type for Raft terms.
+pub type Term = u64;
+/// New Type for Raft Node IDs.
+pub type NodeId = u64;
 /// New type for Raft log Indexes. In Raft, the log uses 1-based indexing; the first entry in the
 /// log has an index of 1. Often an index of 0 is used to indicate "outside the log", for example,
 /// a previous log index of 0 means that there is no previous log.
@@ -46,7 +48,7 @@ pub(crate) type NodeId = u64;
 /// Rust, like most languages, uses 0-based indexing from arrays and similar containers. The
 /// convention in this code base is to use "index" when referring to the 1-based indexing of Raft
 /// logs and "idx" when referring to the 0-based indexing of Rust containers.
-pub(crate) type Index = u64;
+pub type Index = u64;
 wrapper_type!(NonZeroIndex, NonZeroU64, Copy);
 
 impl NonZeroIndex {
@@ -69,12 +71,19 @@ impl From<NonZeroIndex> for Index {
     }
 }
 
+/// Some state machine that Raft is replicating.
+pub trait StateMachine<C: Command> {
+    fn apply(&mut self, entry: &C);
+}
+
+/// Commands that can be processed by a state machine and replicated by Raft.
 pub trait Command: Debug + Clone + Ord + PartialOrd + Eq + PartialEq {}
 
+/// An entry in a Raft log.
 #[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq)]
-pub(crate) struct LogEntry<C: Command> {
-    pub(crate) term: Term,
-    pub(crate) command: C,
+pub struct LogEntry<C: Command> {
+    pub term: Term,
+    pub command: C,
 }
 
 /// Log entries; each entry contains a command for a state machine and a term when the leader
@@ -119,6 +128,12 @@ impl<C: Command> Log<C> {
         self.log.len() as Index
     }
 
+    /// The term of the last entry in the log.
+    pub(crate) fn last_term(&self) -> Option<Term> {
+        let index = self.last_index();
+        self.get(index).map(|entry| entry.term)
+    }
+
     #[cfg(test)]
     pub(crate) fn inner(&self) -> &[LogEntry<C>] {
         &self.log
@@ -144,7 +159,7 @@ impl<C: Command> std::ops::Index<RangeFrom<NonZeroIndex>> for Log<C> {
 
 /// Persistent state on all servers. Updated on stable storage before responding to RPCs.
 #[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq)]
-pub(crate) struct LogState<C: Command> {
+pub struct LogState<C: Command> {
     /// Latest term server has seen, increases monotonically.
     current_term: Term,
     /// Candidate ID that received vote in current term, if one exists.
@@ -205,8 +220,14 @@ impl<C: Command> LogState<C> {
         self.log.extend(entries);
     }
 
-    pub(crate) fn push_log<S: Storage<C>>(&mut self, entry: LogEntry<C>, storage: &S) {
-        self.extend_log([entry], storage)
+    pub(crate) fn push_log<S: Storage<C>>(
+        &mut self,
+        entry: LogEntry<C>,
+        storage: &S,
+    ) -> NonZeroIndex {
+        self.extend_log([entry], storage);
+        let index = self.log.last_index();
+        NonZeroIndex::new(index).expect("an entry was just pushed, so the last index cannot be 0")
     }
 
     #[cfg(test)]
@@ -257,6 +278,7 @@ impl<const N: usize> RoleState<N> {
         matches!(self, RoleState::Leader { .. })
     }
 
+    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn role(&self) -> Role {
         match self {
             RoleState::Follower => Role::Follower,

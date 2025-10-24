@@ -94,6 +94,13 @@ struct TestCase<const N: usize> {
     messages: Vec<Message<Cmd>>,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum Message<C: Command> {
+    InterNodeMessage(InterNodeMessage<C>),
+    Command(C),
+    BecomeCandidate,
+}
+
 impl<const N: usize> Arbitrary for TestCase<N> {
     type Parameters = ();
 
@@ -276,20 +283,39 @@ where
 
     fn arbitrary_with((num_nodes, last_index, current_term): Self::Parameters) -> Self::Strategy {
         prop_oneof![
+            any_with::<InterNodeMessage<C>>((num_nodes, last_index, current_term))
+                .prop_map(|inter_node_message| { Message::InterNodeMessage(inter_node_message) }),
+            Just(Message::BecomeCandidate),
+            any::<C>().prop_map(|cmd| Message::Command(cmd))
+        ]
+        .boxed()
+    }
+
+    type Strategy = BoxedStrategy<Self>;
+}
+
+impl<C: Command + Arbitrary + 'static> Arbitrary for InterNodeMessage<C>
+where
+    <C as Arbitrary>::Strategy: 'static,
+{
+    type Parameters = (usize, Index, Term);
+
+    fn arbitrary_with((num_nodes, last_index, current_term): Self::Parameters) -> Self::Strategy {
+        prop_oneof![
             any_with::<AppendEntriesRequest<C>>((num_nodes, current_term)).prop_map(
-                |append_entries_request| { Message::AppendEntriesRequest(append_entries_request) }
+                |append_entries_request| {
+                    InterNodeMessage::AppendEntriesRequest(append_entries_request)
+                }
             ),
             any_with::<AppendEntriesResponse>((num_nodes, last_index, current_term)).prop_map(
                 |append_entries_response| {
-                    Message::AppendEntriesResponse(append_entries_response)
+                    InterNodeMessage::AppendEntriesResponse(append_entries_response)
                 }
             ),
             any_with::<VoteRequest>((num_nodes, current_term))
-                .prop_map(|vote_request| Message::VoteRequest(vote_request)),
+                .prop_map(|vote_request| InterNodeMessage::VoteRequest(vote_request)),
             any_with::<VoteResponse>(current_term)
-                .prop_map(|vote_response| Message::VoteResponse(vote_response)),
-            Just(Message::BecomeCandidate),
-            any::<C>().prop_map(|cmd| Message::Command(cmd))
+                .prop_map(|vote_response| InterNodeMessage::VoteResponse(vote_response)),
         ]
         .boxed()
     }
@@ -455,20 +481,17 @@ proptest! {
         for message in messages {
             let model = node.model();
 
-            // Execute operation on node. We ignore returned outgoing messages; we only assert invariants.
-            let (expect_ok, apply) = match message {
-                Message::AppendEntriesRequest(_)
-                | Message::AppendEntriesResponse(_)
-                | Message::VoteRequest(_)
-                | Message::VoteResponse(_) => (true, true),
-                Message::Command(_) => (false, true),
-                Message::BecomeCandidate => (true, node.role.role() == Role::Follower),
-            };
-
-            if apply {
-                let res = node.handle_message(message);
-                if expect_ok {
-                    prop_assert!(res.is_ok());
+            // Execute operation on the node. We ignore returned outgoing messages; we only assert
+            // invariants.
+            match message {
+                Message::InterNodeMessage(message) => {
+                    let _ = node.handle_inter_node_message(message);
+                }
+                Message::Command(command) => {
+                    let _ = node.handle_command(command);
+                }
+                Message::BecomeCandidate => {
+                    let _ = node.become_candidate();
                 }
             }
 
