@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 
 use proptest_derive::Arbitrary;
+use tokio::time::timeout;
 
 use super::*;
 use crate::message::*;
@@ -31,7 +32,13 @@ impl Storage<Cmd> for TestStorage {
     fn truncate_log(&self, _start: NonZeroIndex) {}
 }
 
-fn new_node<const N: usize>(id: NodeId) -> RaftCore<N, Cmd, TestStateMachine, TestStorage> {
+fn new_node<const N: usize>(
+    id: NodeId,
+) -> (Raft<N, Cmd, TestStateMachine, TestStorage>, RaftHandle<Cmd>) {
+    Raft::new(id, TestStateMachine::default(), TestStorage)
+}
+
+fn new_core_node<const N: usize>(id: NodeId) -> RaftCore<N, Cmd, TestStateMachine, TestStorage> {
     RaftCore::new(id, TestStateMachine::default(), TestStorage)
 }
 
@@ -48,7 +55,7 @@ fn append_entries_request_rejects_lower_term() {
     const N: usize = 3;
     let node_id = 1;
     let node_term = 5;
-    let mut node = new_node::<N>(node_id);
+    let mut node = new_core_node::<N>(node_id);
     node.set_term(node_term);
 
     let leader_id = 0;
@@ -61,9 +68,7 @@ fn append_entries_request_rejects_lower_term() {
         leader_commit: 0,
     };
 
-    let mut out = node
-        .handle_message(Message::AppendEntriesRequest(req))
-        .unwrap();
+    let mut out = node.handle_inter_node_message(InterNodeMessage::AppendEntriesRequest(req));
     assert_eq!(out.len(), 1);
     let (resp_node_id, msg) = out.remove(0);
     let AppendEntriesResponse {
@@ -85,7 +90,7 @@ fn append_entries_request_rejects_missing_or_mismatch() {
     const N: usize = 3;
     let node_id = 2;
     let node_term = 2;
-    let mut node = new_node::<N>(node_id);
+    let mut node = new_core_node::<N>(node_id);
     node.set_term(node_term);
 
     {
@@ -100,9 +105,7 @@ fn append_entries_request_rejects_missing_or_mismatch() {
             leader_commit: 0,
         };
 
-        let mut out = node
-            .handle_message(Message::AppendEntriesRequest(req))
-            .unwrap();
+        let mut out = node.handle_inter_node_message(InterNodeMessage::AppendEntriesRequest(req));
         assert_eq!(out.len(), 1);
         let (resp_node_id, msg) = out.remove(0);
         let AppendEntriesResponse {
@@ -133,9 +136,7 @@ fn append_entries_request_rejects_missing_or_mismatch() {
             leader_commit: 0,
         };
 
-        let mut out = node
-            .handle_message(Message::AppendEntriesRequest(req))
-            .unwrap();
+        let mut out = node.handle_inter_node_message(InterNodeMessage::AppendEntriesRequest(req));
         assert_eq!(out.len(), 1);
         let (resp_node_id, msg) = out.remove(0);
         let AppendEntriesResponse {
@@ -160,7 +161,7 @@ fn append_entries_request_same_term_makes_candidate_follower() {
     const N: usize = 3;
     let node_id = 0;
     let node_term = 1;
-    let mut node = new_node::<N>(node_id);
+    let mut node = new_core_node::<N>(node_id);
     node.set_term(node_term);
     node.role = RoleState::Candidate { votes: 0 };
 
@@ -175,9 +176,7 @@ fn append_entries_request_same_term_makes_candidate_follower() {
         leader_commit: 0,
     };
 
-    let mut out = node
-        .handle_message(Message::AppendEntriesRequest(req))
-        .unwrap();
+    let mut out = node.handle_inter_node_message(InterNodeMessage::AppendEntriesRequest(req));
     assert_eq!(out.len(), 1);
     let (resp_node_id, msg) = out.remove(0);
     let AppendEntriesResponse {
@@ -202,7 +201,7 @@ fn append_entries_request_conflict_truncate_append_commit_apply() {
     const N: usize = 3;
     let node_id = 1;
     let node_term = 3;
-    let mut node = new_node::<N>(node_id);
+    let mut node = new_core_node::<N>(node_id);
     node.set_term(node_term);
     // Existing log: [(t1, 1), (t2, 2), (t3, 3)].
     node.extend_log([log_entry(1, 1), log_entry(2, 2), log_entry(3, 3)]);
@@ -219,9 +218,7 @@ fn append_entries_request_conflict_truncate_append_commit_apply() {
         leader_commit: 4,
     };
 
-    let mut out = node
-        .handle_message(Message::AppendEntriesRequest(req))
-        .unwrap();
+    let mut out = node.handle_inter_node_message(InterNodeMessage::AppendEntriesRequest(req));
     assert_eq!(out.len(), 1);
     let (resp_node_id, msg) = out.remove(0);
     let AppendEntriesResponse {
@@ -255,7 +252,7 @@ fn append_entries_response_failure_retries_and_decrements() {
     const N: usize = 3;
     let node_id = 0;
     let node_term = 10;
-    let mut node = new_node::<N>(node_id);
+    let mut node = new_core_node::<N>(node_id);
     node.set_term(node_term);
 
     // Add one entry so prev_log_index lookups are valid.
@@ -276,9 +273,7 @@ fn append_entries_response_failure_retries_and_decrements() {
         next_index: None,
     };
 
-    let mut out = node
-        .handle_message(Message::AppendEntriesResponse(resp))
-        .unwrap();
+    let mut out = node.handle_inter_node_message(InterNodeMessage::AppendEntriesResponse(resp));
     // Should send a new AppendEntriesRequest to follower 1 with prev_log_index now 1.
     assert_eq!(out.len(), 1);
     let (resp_node_id, msg) = out.remove(0);
@@ -316,7 +311,7 @@ fn append_entries_response_no_decrement_below_one_but_retries() {
     const N: usize = 3;
     let node_id = 0;
     let node_term = 2;
-    let mut node = new_node::<N>(node_id);
+    let mut node = new_core_node::<N>(node_id);
     node.set_term(node_term);
 
     let log_term = 2;
@@ -335,9 +330,7 @@ fn append_entries_response_no_decrement_below_one_but_retries() {
         next_index: None,
     };
     // Failure should not decrement below 1 but should still produce a retry request.
-    let mut out = node
-        .handle_message(Message::AppendEntriesResponse(resp))
-        .unwrap();
+    let mut out = node.handle_inter_node_message(InterNodeMessage::AppendEntriesResponse(resp));
     assert_eq!(out.len(), 1);
     let (resp_node_id, msg) = out.remove(0);
     let AppendEntriesRequest {
@@ -374,7 +367,7 @@ fn append_entries_response_success_updates_and_commits() {
     const N: usize = 3;
     let node_id = 0;
     let node_term = 7;
-    let mut leader = new_node::<N>(node_id);
+    let mut leader = new_core_node::<N>(node_id);
     leader.set_term(node_term);
     leader.role = RoleState::Leader {
         leader_state: LeaderState::new(0),
@@ -392,9 +385,7 @@ fn append_entries_response_success_updates_and_commits() {
             node_id: 1,
             next_index: Some(NonZeroIndex::new(2).unwrap()),
         };
-        let out = leader
-            .handle_message(Message::AppendEntriesResponse(resp))
-            .unwrap();
+        let out = leader.handle_inter_node_message(InterNodeMessage::AppendEntriesResponse(resp));
         assert_eq!(out, Vec::new());
     }
     assert_eq!(leader.node_state.commit_index, 0);
@@ -407,9 +398,8 @@ fn append_entries_response_success_updates_and_commits() {
             node_id: 2,
             next_index: Some(NonZeroIndex::new(2).unwrap()),
         };
-        let out = leader
-            .handle_message(Message::AppendEntriesResponse(response))
-            .unwrap();
+        let out =
+            leader.handle_inter_node_message(InterNodeMessage::AppendEntriesResponse(response));
         assert_eq!(out, Vec::new());
     }
     assert_eq!(leader.node_state.commit_index, 1);
@@ -421,7 +411,7 @@ fn append_entries_response_success_updates_and_commits() {
 #[test]
 fn append_entries_response_ignored_when_not_leader() {
     const N: usize = 3;
-    let mut node = new_node::<N>(0);
+    let mut node = new_core_node::<N>(0);
     node.set_term(1);
     let role = node.role.clone();
     let log_state = node.log_state.clone();
@@ -437,9 +427,7 @@ fn append_entries_response_ignored_when_not_leader() {
             next_index: None,
         };
 
-        let out = node
-            .handle_message(Message::AppendEntriesResponse(resp))
-            .unwrap();
+        let out = node.handle_inter_node_message(InterNodeMessage::AppendEntriesResponse(resp));
         assert_eq!(out, Vec::new());
         assert_eq!(node.role, role);
         assert_eq!(node.log_state, log_state);
@@ -455,9 +443,7 @@ fn append_entries_response_ignored_when_not_leader() {
             next_index: Some(NonZeroIndex::new(1).unwrap()),
         };
 
-        let out = node
-            .handle_message(Message::AppendEntriesResponse(resp))
-            .unwrap();
+        let out = node.handle_inter_node_message(InterNodeMessage::AppendEntriesResponse(resp));
         assert_eq!(out, Vec::new());
         assert_eq!(node.role, role);
         assert_eq!(node.log_state, log_state);
@@ -470,7 +456,7 @@ fn append_entries_response_ignored_when_not_leader() {
 fn vote_request_rejected_lower_term() {
     const N: usize = 3;
     let node_term = 2;
-    let mut node = new_node::<N>(3);
+    let mut node = new_core_node::<N>(3);
     node.set_term(node_term);
 
     // Lower term rejected.
@@ -482,7 +468,7 @@ fn vote_request_rejected_lower_term() {
         last_log_term: 0,
     };
 
-    let mut out = node.handle_message(Message::VoteRequest(req)).unwrap();
+    let mut out = node.handle_inter_node_message(InterNodeMessage::VoteRequest(req));
     assert_eq!(out.len(), 1);
     let (resp_node_id, msg) = out.remove(0);
     let VoteResponse { term, vote_granted } = msg.unwrap_vote_response();
@@ -496,7 +482,7 @@ fn vote_request_rejected_lower_term() {
 fn vote_request_rejected_already_voted() {
     const N: usize = 3;
     let node_term = 3;
-    let mut node = new_node::<N>(3);
+    let mut node = new_core_node::<N>(3);
     node.set_term(node_term);
     node.set_voted_for(0);
 
@@ -508,7 +494,7 @@ fn vote_request_rejected_already_voted() {
         last_log_term: 5,
     };
 
-    let mut out = node.handle_message(Message::VoteRequest(req)).unwrap();
+    let mut out = node.handle_inter_node_message(InterNodeMessage::VoteRequest(req));
     assert_eq!(out.len(), 1);
     let (resp_node_id, msg) = out.remove(0);
     let VoteResponse { term, vote_granted } = msg.unwrap_vote_response();
@@ -523,7 +509,7 @@ fn vote_request_rejected_not_up_to_date_by_term() {
     const N: usize = 3;
     let node_term = 10;
     let last_term = 6;
-    let mut node = new_node::<N>(3);
+    let mut node = new_core_node::<N>(3);
     node.set_term(node_term);
     node.push_log(log_entry(last_term, 1));
 
@@ -535,7 +521,7 @@ fn vote_request_rejected_not_up_to_date_by_term() {
         last_log_term: last_term - 1,
     };
 
-    let mut out = node.handle_message(Message::VoteRequest(req)).unwrap();
+    let mut out = node.handle_inter_node_message(InterNodeMessage::VoteRequest(req));
     assert_eq!(out.len(), 1);
     let (resp_node_id, msg) = out.remove(0);
     let VoteResponse { term, vote_granted } = msg.unwrap_vote_response();
@@ -551,7 +537,7 @@ fn vote_request_rejected_not_up_to_date_by_index() {
     const N: usize = 3;
     let node_term = 10;
     let last_term = 6;
-    let mut node = new_node::<N>(3);
+    let mut node = new_core_node::<N>(3);
     node.set_term(node_term);
     node.push_log(log_entry(last_term, 1));
 
@@ -563,7 +549,7 @@ fn vote_request_rejected_not_up_to_date_by_index() {
         last_log_term: last_term,
     };
 
-    let mut out = node.handle_message(Message::VoteRequest(req)).unwrap();
+    let mut out = node.handle_inter_node_message(InterNodeMessage::VoteRequest(req));
     assert_eq!(out.len(), 1);
     let (resp_node_id, msg) = out.remove(0);
     let VoteResponse { term, vote_granted } = msg.unwrap_vote_response();
@@ -577,7 +563,7 @@ fn vote_request_rejected_not_up_to_date_by_index() {
 #[test]
 fn vote_request_granted_higher_term() {
     const N: usize = 3;
-    let mut node = new_node::<N>(3);
+    let mut node = new_core_node::<N>(3);
     node.set_term(2);
 
     let candidate_id = 1;
@@ -591,9 +577,8 @@ fn vote_request_granted_higher_term() {
 
     // Grant when up to date by term.
     {
-        let mut out = node
-            .handle_message(Message::VoteRequest(request.clone()))
-            .unwrap();
+        let mut out =
+            node.handle_inter_node_message(InterNodeMessage::VoteRequest(request.clone()));
         assert_eq!(out.len(), 1);
         let (resp_node_id, msg) = out.remove(0);
         let VoteResponse { term, vote_granted } = msg.unwrap_vote_response();
@@ -605,7 +590,7 @@ fn vote_request_granted_higher_term() {
 
     // Grant again to the same candidate.
     {
-        let mut out = node.handle_message(Message::VoteRequest(request)).unwrap();
+        let mut out = node.handle_inter_node_message(InterNodeMessage::VoteRequest(request));
         assert_eq!(out.len(), 1);
         let (resp_node_id, msg) = out.remove(0);
         let VoteResponse { term, vote_granted } = msg.unwrap_vote_response();
@@ -622,7 +607,7 @@ fn vote_request_granted_same_term_up_to_date_by_term() {
     const N: usize = 3;
     let node_term = 10;
     let last_term = 6;
-    let mut node = new_node::<N>(3);
+    let mut node = new_core_node::<N>(3);
     node.set_term(node_term);
     node.push_log(log_entry(last_term, 1));
 
@@ -634,7 +619,7 @@ fn vote_request_granted_same_term_up_to_date_by_term() {
         last_log_term: last_term + 1,
     };
 
-    let mut out = node.handle_message(Message::VoteRequest(req)).unwrap();
+    let mut out = node.handle_inter_node_message(InterNodeMessage::VoteRequest(req));
     assert_eq!(out.len(), 1);
     let (resp_node_id, msg) = out.remove(0);
     let VoteResponse { term, vote_granted } = msg.unwrap_vote_response();
@@ -650,7 +635,7 @@ fn vote_request_granted_same_term_up_to_date_by_index() {
     const N: usize = 3;
     let node_term = 10;
     let last_term = 6;
-    let mut node = new_node::<N>(3);
+    let mut node = new_core_node::<N>(3);
     node.set_term(node_term);
     node.push_log(log_entry(last_term, 1));
 
@@ -662,7 +647,7 @@ fn vote_request_granted_same_term_up_to_date_by_index() {
         last_log_term: last_term,
     };
 
-    let mut out = node.handle_message(Message::VoteRequest(req)).unwrap();
+    let mut out = node.handle_inter_node_message(InterNodeMessage::VoteRequest(req));
     assert_eq!(out.len(), 1);
     let (resp_node_id, msg) = out.remove(0);
     let VoteResponse { term, vote_granted } = msg.unwrap_vote_response();
@@ -677,7 +662,7 @@ fn vote_request_granted_same_term_up_to_date_by_index() {
 fn vote_response_rejected_same_term() {
     const N: usize = 3;
     let node_term = 4;
-    let mut node = new_node::<N>(0);
+    let mut node = new_core_node::<N>(0);
     node.set_term(node_term);
 
     let role = RoleState::Candidate { votes: 1 };
@@ -688,7 +673,7 @@ fn vote_response_rejected_same_term() {
         vote_granted: false,
     };
 
-    let out = node.handle_message(Message::VoteResponse(resp)).unwrap();
+    let out = node.handle_inter_node_message(InterNodeMessage::VoteResponse(resp));
     assert_eq!(out, Vec::new());
     assert_eq!(node.role, role);
 }
@@ -698,7 +683,7 @@ fn vote_response_rejected_same_term() {
 fn vote_response_rejected_later_term() {
     const N: usize = 3;
     let node_term = 4;
-    let mut node = new_node::<N>(0);
+    let mut node = new_core_node::<N>(0);
     node.set_term(node_term);
 
     let role = RoleState::Candidate { votes: 1 };
@@ -710,7 +695,7 @@ fn vote_response_rejected_later_term() {
         vote_granted: false,
     };
 
-    let out = node.handle_message(Message::VoteResponse(resp)).unwrap();
+    let out = node.handle_inter_node_message(InterNodeMessage::VoteResponse(resp));
     assert_eq!(out, Vec::new());
     assert_eq!(node.role, RoleState::Follower);
     assert_eq!(*node.log_state.current_term(), response_term);
@@ -720,7 +705,7 @@ fn vote_response_rejected_later_term() {
 #[test]
 fn vote_response_granted() {
     const N: usize = 3;
-    let mut node = new_node::<N>(3);
+    let mut node = new_core_node::<N>(3);
     node.role = RoleState::Candidate { votes: 0 };
 
     let resp = VoteResponse {
@@ -728,7 +713,7 @@ fn vote_response_granted() {
         vote_granted: true,
     };
 
-    let out = node.handle_message(Message::VoteResponse(resp)).unwrap();
+    let out = node.handle_inter_node_message(InterNodeMessage::VoteResponse(resp));
     assert_eq!(out, Vec::new());
     assert_eq!(node.role, RoleState::Candidate { votes: 1 });
 }
@@ -737,7 +722,7 @@ fn vote_response_granted() {
 #[test]
 fn vote_response_granted_promotion() {
     const N: usize = 3;
-    let mut node = new_node::<N>(3);
+    let mut node = new_core_node::<N>(3);
     node.role = RoleState::Candidate { votes: 1 };
     node.extend_log([log_entry(1, 1), log_entry(2, 2)]);
 
@@ -746,7 +731,7 @@ fn vote_response_granted_promotion() {
         vote_granted: true,
     };
 
-    let out = node.handle_message(Message::VoteResponse(resp)).unwrap();
+    let out = node.handle_inter_node_message(InterNodeMessage::VoteResponse(resp));
     assert_eq!(out, Vec::new());
     assert_eq!(
         node.role,
@@ -764,7 +749,7 @@ fn vote_response_granted_promotion() {
 fn vote_response_ignored() {
     const N: usize = 3;
     let node_term = 4;
-    let mut node = new_node::<N>(0);
+    let mut node = new_core_node::<N>(0);
     node.set_term(node_term);
 
     // As a follower, ignore.
@@ -775,7 +760,7 @@ fn vote_response_ignored() {
             vote_granted: true,
         };
 
-        let out = node.handle_message(Message::VoteResponse(resp)).unwrap();
+        let out = node.handle_inter_node_message(InterNodeMessage::VoteResponse(resp));
         assert_eq!(out, Vec::new());
         assert_eq!(node.role.role(), Role::Follower);
     }
@@ -790,7 +775,7 @@ fn vote_response_ignored() {
             vote_granted: true,
         };
 
-        let out = node.handle_message(Message::VoteResponse(resp)).unwrap();
+        let out = node.handle_inter_node_message(InterNodeMessage::VoteResponse(resp));
         assert_eq!(out, Vec::new());
         assert_eq!(node.role, role);
     }
@@ -802,11 +787,11 @@ fn become_candidate_broadcasts_votes() {
     const N: usize = 3;
     let node_id = 1;
     let node_term = 1;
-    let mut node = new_node::<N>(node_id);
+    let mut node = new_core_node::<N>(node_id);
     node.set_term(node_term);
     node.push_log(log_entry(node_term, 0));
 
-    let out = node.handle_message(Message::BecomeCandidate).unwrap();
+    let out = node.handle_become_candidate().unwrap();
     // Two peers (0 and 2) receive VoteRequest.
     assert_eq!(out.len(), 2);
     let (response_node_ids, mut msgs): (BTreeSet<_>, Vec<_>) = out.into_iter().unzip();
@@ -829,19 +814,17 @@ fn become_candidate_broadcasts_votes() {
 #[test]
 fn command_follower_errors() {
     const N: usize = 3;
-    let mut follower = new_node::<N>(0);
+    let mut follower = new_core_node::<N>(0);
 
     // No known leader yet.
     let cmd = Cmd(1);
-    let err = follower
-        .handle_message(Message::Command(cmd.clone()))
-        .unwrap_err();
-    assert_eq!(err, Error::NotLeader(None));
+    let err = follower.handle_command(cmd.clone()).unwrap_err();
+    assert_eq!(err, CommandError::NotLeader(None));
 
     // Leader known.
     follower.node_state.leader_id = Some(2);
-    let err = follower.handle_message(Message::Command(cmd)).unwrap_err();
-    assert_eq!(err, Error::NotLeader(Some(2)));
+    let err = follower.handle_command(cmd).unwrap_err();
+    assert_eq!(err, CommandError::NotLeader(Some(2)));
 }
 
 // Accepted client command sends AppendEntries to peers.
@@ -860,7 +843,7 @@ fn command_leader_sends_append_entries() {
         ],
         match_index: [0; N],
     };
-    let mut node = new_node::<N>(node_id);
+    let mut node = new_core_node::<N>(node_id);
     node.set_term(node_term);
     node.extend_log(entries.clone());
     node.role = RoleState::Leader { leader_state };
@@ -869,10 +852,17 @@ fn command_leader_sends_append_entries() {
     let new_log_entry = log_entry(node_term, cmd.0);
     entries.push(new_log_entry.clone());
 
-    let mut out = node.handle_message(Message::Command(cmd)).unwrap();
+    let CommandResponse {
+        messages: mut out,
+        command_index: commit_index,
+    } = node.handle_command(cmd).unwrap();
     out.sort_by_key(|(node_id, _)| *node_id);
     // Three append requests to peers.
     assert_eq!(out.len(), 3);
+    assert_eq!(
+        commit_index,
+        NonZeroIndex::new(entries.len() as Index).unwrap()
+    );
     let (response_node_ids, msgs): (Vec<_>, Vec<_>) = out.into_iter().unzip();
     assert_eq!(response_node_ids, vec![0, 2, 3]);
     let append_entries_requests: Vec<_> = msgs
@@ -912,19 +902,19 @@ fn command_leader_sends_append_entries() {
 #[test]
 fn higher_term_resets_and_clears_vote() {
     const N: usize = 3;
-    let mut node = new_node::<N>(1);
-    let _ = node.handle_message(Message::BecomeCandidate).unwrap();
+    let mut node = new_core_node::<N>(1);
+    let _ = node.handle_become_candidate().unwrap();
     node.set_voted_for(42);
 
     // Receive higher term AppendEntriesResponse (could be any).
-    let _ = node
-        .handle_message(Message::AppendEntriesResponse(AppendEntriesResponse {
+    let _ = node.handle_inter_node_message(InterNodeMessage::AppendEntriesResponse(
+        AppendEntriesResponse {
             term: *node.current_term() + 5,
             success: false,
             node_id: 0,
             next_index: None,
-        }))
-        .unwrap();
+        },
+    ));
     assert_eq!(node.role.role(), Role::Follower);
     assert_eq!(*node.log_state.voted_for(), None);
 }
@@ -933,7 +923,7 @@ fn higher_term_resets_and_clears_vote() {
 #[test]
 fn no_commit_prev_term() {
     const N: usize = 3;
-    let mut leader = new_node::<N>(0);
+    let mut leader = new_core_node::<N>(0);
     // Current term 7, but the log entry is from term 6.
     leader.set_term(7);
     leader.role = RoleState::Leader {
@@ -954,17 +944,107 @@ fn no_commit_prev_term() {
         node_id: 2,
         next_index: Some(NonZeroIndex::new(2).unwrap()),
     };
-    let out = leader
-        .handle_message(Message::AppendEntriesResponse(resp1))
-        .unwrap();
+    let out = leader.handle_inter_node_message(InterNodeMessage::AppendEntriesResponse(resp1));
     assert_eq!(out, Vec::new());
-    let out = leader
-        .handle_message(Message::AppendEntriesResponse(resp2))
-        .unwrap();
+    let out = leader.handle_inter_node_message(InterNodeMessage::AppendEntriesResponse(resp2));
     assert_eq!(out, Vec::new());
 
     // Commit index should not advance because log[1].term != currentTerm.
     assert_eq!(leader.node_state.commit_index, 0);
     assert_eq!(leader.node_state.last_applied, 0);
     assert_eq!(leader.state_machine.applied, Vec::new());
+}
+
+// Raft task shuts down cleanly when the channels are closed.
+#[tokio::test]
+async fn test_raft_command_responses() {
+    let (raft, raft_handle) = new_node::<1>(0);
+    let raft_task = tokio::spawn(raft.run());
+
+    // Retry sending the command until the node is promoted to leader.
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let command_rx = raft_handle.send_command(Cmd(42));
+            match command_rx.await.unwrap() {
+                Ok(()) => {
+                    break;
+                }
+                Err(e) => assert_eq!(e, CommandError::NotLeader(None)),
+            }
+        }
+    })
+    .await
+    .unwrap();
+
+    drop(raft_handle);
+    raft_task.await.unwrap();
+}
+
+// Raft task sends heartbeats out, when leader.
+#[tokio::test]
+async fn test_raft_heartbeats() {
+    let leader_id = 0;
+    let (raft, mut raft_handle) = new_node::<2>(leader_id);
+    let raft_task = tokio::spawn(raft.run());
+
+    // Wait for the vote request.
+    let (mut vote_node_id, mut vote_request) = raft_handle.receive_message().await.unwrap();
+
+    // Retry election until the node is promoted to leader.
+    let (heartbeat_node_id, heartbeat, term) = timeout(Duration::from_secs(5), async {
+        let mut term;
+        loop {
+            term = vote_request.term();
+            assert_eq!(vote_node_id, 1);
+            assert_eq!(
+                vote_request,
+                InterNodeMessage::VoteRequest(VoteRequest {
+                    term,
+                    candidate_id: leader_id,
+                    last_log_index: 0,
+                    last_log_term: Term::MIN,
+                })
+            );
+
+            // Send a vote response to promote node to leader.
+            raft_handle.send_message(InterNodeMessage::VoteResponse(VoteResponse {
+                term,
+                vote_granted: true,
+            }));
+
+            // Wait for a heartbeat.
+            // It's technically possible but rare that a new election was started before the node
+            // received our vote response. In that case, we'll get a new vote request. This should only
+            // really happen if tests are being run in parallel and the machine is overloaded.
+            let (node_id, message) = raft_handle.receive_message().await.unwrap();
+            match message {
+                InterNodeMessage::AppendEntriesRequest(AppendEntriesRequest { .. }) => {
+                    break (node_id, message, term);
+                }
+                InterNodeMessage::VoteRequest(VoteRequest { .. }) => {
+                    vote_node_id = node_id;
+                    vote_request = message;
+                }
+                msg => panic!("Unexpected message: {msg:?}"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(heartbeat_node_id, 1);
+    assert_eq!(
+        heartbeat,
+        InterNodeMessage::AppendEntriesRequest(AppendEntriesRequest {
+            term,
+            leader_id,
+            prev_log_index: 0,
+            prev_log_term: Term::MIN,
+            entries: vec![],
+            leader_commit: 0,
+        })
+    );
+
+    drop(raft_handle);
+    raft_task.await.unwrap();
 }
