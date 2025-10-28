@@ -58,8 +58,8 @@ impl<C: Command> RaftHandle<C> {
 
 /// The entire Raft algorithm for a single node, including the non-deterministic timing-based parts
 /// (heartbeats and election timers).
-pub struct Raft<const N: usize, C: Command, SM: StateMachine<C>, S: Storage<C>> {
-    core: RaftCore<N, C, SM, S>,
+pub struct Raft<C: Command, SM: StateMachine<C>, S: Storage<C>> {
+    core: RaftCore<C, SM, S>,
 
     incoming_rx: mpsc::UnboundedReceiver<InterNodeMessage<C>>,
     outgoing_tx: mpsc::UnboundedSender<(NodeId, InterNodeMessage<C>)>,
@@ -71,13 +71,18 @@ pub struct Raft<const N: usize, C: Command, SM: StateMachine<C>, S: Storage<C>> 
     awaiting_clients: VecDeque<(NonZeroIndex, oneshot::Sender<Result<(), CommandError>>)>,
 }
 
-impl<const N: usize, C: Command, SM: StateMachine<C>, S: Storage<C>> Raft<N, C, SM, S> {
+impl<C: Command, SM: StateMachine<C>, S: Storage<C>> Raft<C, SM, S> {
     /// Creates a new [`Raft`] that stores persistent state in `storage` and applies committed
     /// commands to `state_machine`.
     ///
     /// Returns the [`Raft`] node and a [`RaftHandle`] to communicate with that node.
-    pub fn new(node_id: NodeId, state_machine: SM, storage: S) -> (Self, RaftHandle<C>) {
-        let core = RaftCore::new(node_id, state_machine, storage);
+    pub fn new(
+        node_id: NodeId,
+        cluster_size: usize,
+        state_machine: SM,
+        storage: S,
+    ) -> (Self, RaftHandle<C>) {
+        let core = RaftCore::new(node_id, cluster_size, state_machine, storage);
 
         let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
         let (outgoing_tx, outgoing_rx) = mpsc::unbounded_channel();
@@ -211,23 +216,25 @@ impl<const N: usize, C: Command, SM: StateMachine<C>, S: Storage<C>> Raft<N, C, 
 /// contain any timers or networking code.
 #[derive(Derivative, Clone)]
 #[derivative(Debug, PartialEq, Eq)]
-pub struct RaftCore<const N: usize, C: Command, SM: StateMachine<C>, S: Storage<C>> {
+pub struct RaftCore<C: Command, SM: StateMachine<C>, S: Storage<C>> {
     node_id: NodeId,
+    cluster_size: usize,
     log_state: LogState<C>,
     node_state: NodeState,
-    role: RoleState<N>,
+    role: RoleState,
     #[derivative(Debug = "ignore", PartialEq = "ignore")]
     state_machine: SM,
     #[derivative(Debug = "ignore", PartialEq = "ignore")]
     storage: S,
 }
 
-impl<const N: usize, C: Command, SM: StateMachine<C>, S: Storage<C>> RaftCore<N, C, SM, S> {
+impl<C: Command, SM: StateMachine<C>, S: Storage<C>> RaftCore<C, SM, S> {
     /// Creates a new [`RaftCore`] that stores persistent state in `storage` and applies committed
     /// commands to `state_machine`.
-    pub fn new(node_id: NodeId, state_machine: SM, storage: S) -> Self {
+    pub fn new(node_id: NodeId, cluster_size: usize, state_machine: SM, storage: S) -> Self {
         Self {
             node_id,
+            cluster_size,
             log_state: LogState::new(&storage),
             node_state: NodeState::new(),
             role: RoleState::Follower,
@@ -435,7 +442,7 @@ impl<const N: usize, C: Command, SM: StateMachine<C>, S: Storage<C>> RaftCore<N,
         // If there exists an N such that N > commitIndex, a majority
         // of matchIndex[i] ≥ N, and log[N].term == currentTerm:
         // set commitIndex = N (§5.3, §5.4).
-        let mut match_index: Vec<_> = match_index.iter().copied().collect();
+        let mut match_index: Vec<_> = match_index.clone();
         match_index.sort_unstable();
         let new_commit_index = match_index[match_index.len() / 2];
         if let Some(new_commit_entry) = self.log_state.log().get(new_commit_index)
@@ -549,10 +556,13 @@ impl<const N: usize, C: Command, SM: StateMachine<C>, S: Storage<C>> RaftCore<N,
         };
         if vote_granted {
             *votes += 1;
-            // If votes received from majority of servers: become leader.
-            if *votes > N / 2 {
+            // If votes received from a majority of servers: become leader.
+            if *votes > self.cluster_size / 2 {
                 self.role = RoleState::Leader {
-                    leader_state: LeaderState::new(self.log_state.log().last_index()),
+                    leader_state: LeaderState::new(
+                        self.log_state.log().last_index(),
+                        self.cluster_size,
+                    ),
                 };
             }
         }
@@ -597,12 +607,8 @@ impl<const N: usize, C: Command, SM: StateMachine<C>, S: Storage<C>> RaftCore<N,
             command,
         });
 
-        let mut messages = Vec::with_capacity(N - 1);
-        for node_id in 0..N {
-            let node_id = node_id as NodeId;
-            if node_id == self.node_id {
-                continue;
-            }
+        let mut messages = Vec::with_capacity(self.cluster_size - 1);
+        for node_id in self.peers() {
             let append_entries_request = self.generate_append_entry_request_for(node_id);
             messages.push((
                 node_id,
@@ -742,7 +748,7 @@ impl<const N: usize, C: Command, SM: StateMachine<C>, S: Storage<C>> RaftCore<N,
 
     /// Returns an iterator of all [`NodeId`]s, excluding the current node's ID.
     fn peers(&self) -> impl Iterator<Item = NodeId> {
-        (0..N)
+        (0..self.cluster_size)
             .map(|node_id| node_id as NodeId)
             .filter(|node_id| *node_id != self.node_id)
     }
