@@ -32,14 +32,15 @@ impl Storage<Cmd> for TestStorage {
     fn truncate_log(&self, _start: NonZeroIndex) {}
 }
 
-fn new_node<const N: usize>(
+fn new_node(
     id: NodeId,
-) -> (Raft<N, Cmd, TestStateMachine, TestStorage>, RaftHandle<Cmd>) {
-    Raft::new(id, TestStateMachine::default(), TestStorage)
+    cluster_size: usize,
+) -> (Raft<Cmd, TestStateMachine, TestStorage>, RaftHandle<Cmd>) {
+    Raft::new(id, cluster_size, TestStateMachine::default(), TestStorage)
 }
 
-fn new_core_node<const N: usize>(id: NodeId) -> RaftCore<N, Cmd, TestStateMachine, TestStorage> {
-    RaftCore::new(id, TestStateMachine::default(), TestStorage)
+fn new_core_node(id: NodeId, cluster_size: usize) -> RaftCore<Cmd, TestStateMachine, TestStorage> {
+    RaftCore::new(id, cluster_size, TestStateMachine::default(), TestStorage)
 }
 
 fn log_entry(term: Term, cmd: i32) -> LogEntry<Cmd> {
@@ -52,10 +53,10 @@ fn log_entry(term: Term, cmd: i32) -> LogEntry<Cmd> {
 // Reject AppendEntries RPCs with a lower term.
 #[test]
 fn append_entries_request_rejects_lower_term() {
-    const N: usize = 3;
+    let cluster_size = 3;
     let node_id = 1;
     let node_term = 5;
-    let mut node = new_core_node::<N>(node_id);
+    let mut node = new_core_node(node_id, cluster_size);
     node.set_term(node_term);
 
     let leader_id = 0;
@@ -87,10 +88,10 @@ fn append_entries_request_rejects_lower_term() {
 // Reject AppendEntries if prev_log is missing or term mismatches.
 #[test]
 fn append_entries_request_rejects_missing_or_mismatch() {
-    const N: usize = 3;
+    let cluster_size = 3;
     let node_id = 2;
     let node_term = 2;
-    let mut node = new_core_node::<N>(node_id);
+    let mut node = new_core_node(node_id, cluster_size);
     node.set_term(node_term);
 
     {
@@ -158,10 +159,10 @@ fn append_entries_request_rejects_missing_or_mismatch() {
 // Receiving AppendEntries of the same term makes a candidate step down to follower.
 #[test]
 fn append_entries_request_same_term_makes_candidate_follower() {
-    const N: usize = 3;
+    let cluster_size = 3;
     let node_id = 0;
     let node_term = 1;
-    let mut node = new_core_node::<N>(node_id);
+    let mut node = new_core_node(node_id, cluster_size);
     node.set_term(node_term);
     node.role = RoleState::Candidate { votes: 0 };
 
@@ -198,10 +199,10 @@ fn append_entries_request_same_term_makes_candidate_follower() {
 // Conflicting entries are truncated; new entries appended; commit and apply follow the leader.
 #[test]
 fn append_entries_request_conflict_truncate_append_commit_apply() {
-    const N: usize = 3;
+    let cluster_size = 3;
     let node_id = 1;
     let node_term = 3;
-    let mut node = new_core_node::<N>(node_id);
+    let mut node = new_core_node(node_id, cluster_size);
     node.set_term(node_term);
     // Existing log: [(t1, 1), (t2, 2), (t3, 3)].
     node.extend_log([log_entry(1, 1), log_entry(2, 2), log_entry(3, 3)]);
@@ -249,10 +250,10 @@ fn append_entries_request_conflict_truncate_append_commit_apply() {
 // On failure, leader decrements next_index and retries.
 #[test]
 fn append_entries_response_failure_retries_and_decrements() {
-    const N: usize = 3;
+    let cluster_size = 3;
     let node_id = 0;
     let node_term = 10;
-    let mut node = new_core_node::<N>(node_id);
+    let mut node = new_core_node(node_id, cluster_size);
     node.set_term(node_term);
 
     // Add one entry so prev_log_index lookups are valid.
@@ -261,7 +262,7 @@ fn append_entries_response_failure_retries_and_decrements() {
 
     // Become leader manually.
     // Set follower 1 next_index to 3 (so prev_log_index = 2).
-    let mut leader_state = LeaderState::new(node.log_state.log().last_index());
+    let mut leader_state = LeaderState::new(node.log_state.log().last_index(), cluster_size);
     leader_state.next_index[1] = NonZeroIndex::new(3).unwrap();
     node.role = RoleState::Leader { leader_state };
 
@@ -308,17 +309,17 @@ fn append_entries_response_failure_retries_and_decrements() {
 // Failure response does not decrement next_index below 1 but still retries.
 #[test]
 fn append_entries_response_no_decrement_below_one_but_retries() {
-    const N: usize = 3;
+    let cluster_size = 3;
     let node_id = 0;
     let node_term = 2;
-    let mut node = new_core_node::<N>(node_id);
+    let mut node = new_core_node(node_id, cluster_size);
     node.set_term(node_term);
 
     let log_term = 2;
     node.push_log(log_entry(log_term, 1));
 
     // Force follower next_index to 1.
-    let mut leader_state = LeaderState::new(node.log_state.log().last_index());
+    let mut leader_state = LeaderState::new(node.log_state.log().last_index(), cluster_size);
     leader_state.next_index[1] = NonZeroIndex::new(1).unwrap();
     node.role = RoleState::Leader { leader_state };
 
@@ -364,13 +365,13 @@ fn append_entries_response_no_decrement_below_one_but_retries() {
 // Successful AppendEntriesResponse updates indices and can advance commit.
 #[test]
 fn append_entries_response_success_updates_and_commits() {
-    const N: usize = 3;
+    let cluster_size = 3;
     let node_id = 0;
     let node_term = 7;
-    let mut leader = new_core_node::<N>(node_id);
+    let mut leader = new_core_node(node_id, cluster_size);
     leader.set_term(node_term);
     leader.role = RoleState::Leader {
-        leader_state: LeaderState::new(0),
+        leader_state: LeaderState::new(0, cluster_size),
     };
 
     // Leader has one entry at term 7.
@@ -410,8 +411,8 @@ fn append_entries_response_success_updates_and_commits() {
 // Leaders only process AppendEntriesResponse; followers ignore them (both success and failure).
 #[test]
 fn append_entries_response_ignored_when_not_leader() {
-    const N: usize = 3;
-    let mut node = new_core_node::<N>(0);
+    let cluster_size = 3;
+    let mut node = new_core_node(0, cluster_size);
     node.set_term(1);
     let role = node.role.clone();
     let log_state = node.log_state.clone();
@@ -454,9 +455,9 @@ fn append_entries_response_ignored_when_not_leader() {
 // Reject VoteRequest with a lower term.
 #[test]
 fn vote_request_rejected_lower_term() {
-    const N: usize = 3;
+    let cluster_size = 3;
     let node_term = 2;
-    let mut node = new_core_node::<N>(3);
+    let mut node = new_core_node(3, cluster_size);
     node.set_term(node_term);
 
     // Lower term rejected.
@@ -480,9 +481,9 @@ fn vote_request_rejected_lower_term() {
 // Reject VoteRequest if a node has already voted.
 #[test]
 fn vote_request_rejected_already_voted() {
-    const N: usize = 3;
+    let cluster_size = 3;
     let node_term = 3;
-    let mut node = new_core_node::<N>(3);
+    let mut node = new_core_node(3, cluster_size);
     node.set_term(node_term);
     node.set_voted_for(0);
 
@@ -506,10 +507,10 @@ fn vote_request_rejected_already_voted() {
 // Reject VoteRequest if a candidate's log has a lower last log term.
 #[test]
 fn vote_request_rejected_not_up_to_date_by_term() {
-    const N: usize = 3;
+    let cluster_size = 3;
     let node_term = 10;
     let last_term = 6;
-    let mut node = new_core_node::<N>(3);
+    let mut node = new_core_node(3, cluster_size);
     node.set_term(node_term);
     node.push_log(log_entry(last_term, 1));
 
@@ -534,10 +535,10 @@ fn vote_request_rejected_not_up_to_date_by_term() {
 // Reject VoteRequest if a candidate's log has a lower last log index.
 #[test]
 fn vote_request_rejected_not_up_to_date_by_index() {
-    const N: usize = 3;
+    let cluster_size = 3;
     let node_term = 10;
     let last_term = 6;
-    let mut node = new_core_node::<N>(3);
+    let mut node = new_core_node(3, cluster_size);
     node.set_term(node_term);
     node.push_log(log_entry(last_term, 1));
 
@@ -562,8 +563,8 @@ fn vote_request_rejected_not_up_to_date_by_index() {
 // Grant VoteRequest with higher terms.
 #[test]
 fn vote_request_granted_higher_term() {
-    const N: usize = 3;
-    let mut node = new_core_node::<N>(3);
+    let cluster_size = 3;
+    let mut node = new_core_node(3, cluster_size);
     node.set_term(2);
 
     let candidate_id = 1;
@@ -604,10 +605,10 @@ fn vote_request_granted_higher_term() {
 // Grant VoteRequest if the candidate's log has a larger last log term.
 #[test]
 fn vote_request_granted_same_term_up_to_date_by_term() {
-    const N: usize = 3;
+    let cluster_size = 3;
     let node_term = 10;
     let last_term = 6;
-    let mut node = new_core_node::<N>(3);
+    let mut node = new_core_node(3, cluster_size);
     node.set_term(node_term);
     node.push_log(log_entry(last_term, 1));
 
@@ -632,10 +633,10 @@ fn vote_request_granted_same_term_up_to_date_by_term() {
 // Grant VoteRequest if the candidate's log has a larger last log index.
 #[test]
 fn vote_request_granted_same_term_up_to_date_by_index() {
-    const N: usize = 3;
+    let cluster_size = 3;
     let node_term = 10;
     let last_term = 6;
-    let mut node = new_core_node::<N>(3);
+    let mut node = new_core_node(3, cluster_size);
     node.set_term(node_term);
     node.push_log(log_entry(last_term, 1));
 
@@ -660,9 +661,9 @@ fn vote_request_granted_same_term_up_to_date_by_index() {
 // Rejected VoteResponse is ignored if it's in the same term.
 #[test]
 fn vote_response_rejected_same_term() {
-    const N: usize = 3;
+    let cluster_size = 3;
     let node_term = 4;
-    let mut node = new_core_node::<N>(0);
+    let mut node = new_core_node(0, cluster_size);
     node.set_term(node_term);
 
     let role = RoleState::Candidate { votes: 1 };
@@ -681,9 +682,9 @@ fn vote_response_rejected_same_term() {
 // Rejected VoteResponse causes a demotion if it's in a later term.
 #[test]
 fn vote_response_rejected_later_term() {
-    const N: usize = 3;
+    let cluster_size = 3;
     let node_term = 4;
-    let mut node = new_core_node::<N>(0);
+    let mut node = new_core_node(0, cluster_size);
     node.set_term(node_term);
 
     let role = RoleState::Candidate { votes: 1 };
@@ -704,8 +705,8 @@ fn vote_response_rejected_later_term() {
 // Granted VoteResponse increments vote count.
 #[test]
 fn vote_response_granted() {
-    const N: usize = 3;
-    let mut node = new_core_node::<N>(3);
+    let cluster_size = 3;
+    let mut node = new_core_node(3, cluster_size);
     node.role = RoleState::Candidate { votes: 0 };
 
     let resp = VoteResponse {
@@ -721,8 +722,8 @@ fn vote_response_granted() {
 // A majority of granted VoteResponse promotes the node.
 #[test]
 fn vote_response_granted_promotion() {
-    const N: usize = 3;
-    let mut node = new_core_node::<N>(3);
+    let cluster_size = 3;
+    let mut node = new_core_node(3, cluster_size);
     node.role = RoleState::Candidate { votes: 1 };
     node.extend_log([log_entry(1, 1), log_entry(2, 2)]);
 
@@ -737,8 +738,10 @@ fn vote_response_granted_promotion() {
         node.role,
         RoleState::Leader {
             leader_state: LeaderState {
-                next_index: [NonZeroIndex::new(3).unwrap(); N],
-                match_index: [0; N],
+                next_index: (0..cluster_size)
+                    .map(|_| NonZeroIndex::new(3).unwrap())
+                    .collect(),
+                match_index: (0..cluster_size).map(|_| 0).collect(),
             }
         }
     );
@@ -747,9 +750,9 @@ fn vote_response_granted_promotion() {
 // VoteResponse is ignored if node is follower or response has an older term.
 #[test]
 fn vote_response_ignored() {
-    const N: usize = 3;
+    let cluster_size = 3;
     let node_term = 4;
-    let mut node = new_core_node::<N>(0);
+    let mut node = new_core_node(0, cluster_size);
     node.set_term(node_term);
 
     // As a follower, ignore.
@@ -784,10 +787,10 @@ fn vote_response_ignored() {
 // Becoming a candidate increments term, self-votes, and broadcasts VoteRequest to peers.
 #[test]
 fn become_candidate_broadcasts_votes() {
-    const N: usize = 3;
+    let cluster_size = 3;
     let node_id = 1;
     let node_term = 1;
-    let mut node = new_core_node::<N>(node_id);
+    let mut node = new_core_node(node_id, cluster_size);
     node.set_term(node_term);
     node.push_log(log_entry(node_term, 0));
 
@@ -813,8 +816,8 @@ fn become_candidate_broadcasts_votes() {
 // Commands on a follower error with NotLeader, including a leader hint when known.
 #[test]
 fn command_follower_errors() {
-    const N: usize = 3;
-    let mut follower = new_core_node::<N>(0);
+    let cluster_size = 3;
+    let mut follower = new_core_node(0, cluster_size);
 
     // No known leader yet.
     let cmd = Cmd(1);
@@ -830,20 +833,20 @@ fn command_follower_errors() {
 // Accepted client command sends AppendEntries to peers.
 #[test]
 fn command_leader_sends_append_entries() {
-    const N: usize = 4;
+    let cluster_size = 4;
     let node_id = 1;
     let node_term = 3;
     let mut entries = vec![log_entry(1, 1), log_entry(2, 2), log_entry(3, 3)];
     let leader_state = LeaderState {
-        next_index: [
+        next_index: vec![
             NonZeroIndex::new(2).unwrap(),
             NonZeroIndex::new(4).unwrap(),
             NonZeroIndex::new(4).unwrap(),
             NonZeroIndex::new(1).unwrap(),
         ],
-        match_index: [0; N],
+        match_index: (0..cluster_size).map(|_| 0).collect(),
     };
-    let mut node = new_core_node::<N>(node_id);
+    let mut node = new_core_node(node_id, cluster_size);
     node.set_term(node_term);
     node.extend_log(entries.clone());
     node.role = RoleState::Leader { leader_state };
@@ -901,8 +904,8 @@ fn command_leader_sends_append_entries() {
 // Any message with a higher term resets term, clears voted_for, and steps down.
 #[test]
 fn higher_term_resets_and_clears_vote() {
-    const N: usize = 3;
-    let mut node = new_core_node::<N>(1);
+    let cluster_size = 3;
+    let mut node = new_core_node(1, cluster_size);
     let _ = node.handle_become_candidate().unwrap();
     node.set_voted_for(42);
 
@@ -922,12 +925,12 @@ fn higher_term_resets_and_clears_vote() {
 // Majority replication does not commit entries from a prior term.
 #[test]
 fn no_commit_prev_term() {
-    const N: usize = 3;
-    let mut leader = new_core_node::<N>(0);
+    let cluster_size = 3;
+    let mut leader = new_core_node(0, cluster_size);
     // Current term 7, but the log entry is from term 6.
     leader.set_term(7);
     leader.role = RoleState::Leader {
-        leader_state: LeaderState::new(0),
+        leader_state: LeaderState::new(0, cluster_size),
     };
     // index 1, term 6.
     leader.push_log(log_entry(6, 5));
@@ -958,7 +961,7 @@ fn no_commit_prev_term() {
 // Raft task shuts down cleanly when the channels are closed.
 #[tokio::test]
 async fn test_raft_command_responses() {
-    let (raft, raft_handle) = new_node::<1>(0);
+    let (raft, raft_handle) = new_node(0, 1);
     let raft_task = tokio::spawn(raft.run());
 
     // Retry sending the command until the node is promoted to leader.
@@ -984,7 +987,7 @@ async fn test_raft_command_responses() {
 #[tokio::test]
 async fn test_raft_heartbeats() {
     let leader_id = 0;
-    let (raft, mut raft_handle) = new_node::<2>(leader_id);
+    let (raft, mut raft_handle) = new_node(leader_id, 2);
     let raft_task = tokio::spawn(raft.run());
 
     // Wait for the vote request.

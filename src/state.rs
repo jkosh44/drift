@@ -263,13 +263,13 @@ impl NodeState {
 
 /// The current role and role associated state of a Raft node.
 #[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq)]
-pub(crate) enum RoleState<const N: usize> {
+pub(crate) enum RoleState {
     Follower,
     Candidate { votes: usize },
-    Leader { leader_state: LeaderState<N> },
+    Leader { leader_state: LeaderState },
 }
 
-impl<const N: usize> RoleState<N> {
+impl RoleState {
     pub(crate) fn is_candidate(&self) -> bool {
         matches!(self, RoleState::Candidate { .. })
     }
@@ -298,21 +298,21 @@ pub(crate) enum Role {
 
 /// Volatile state on leaders.
 #[derive(Debug, Clone, Ord, PartialOrd, Eq, PartialEq)]
-pub(crate) struct LeaderState<const N: usize> {
-    /// For each server, index of the next log entry to send to that server.
-    pub(crate) next_index: [NonZeroIndex; N],
+pub(crate) struct LeaderState {
+    /// For each server, the index of the next log entry to send to that server.
+    pub(crate) next_index: Vec<NonZeroIndex>,
     /// For each server, index of highest log entry known to be replicated on server, increases
     /// monotonically.
-    pub(crate) match_index: [Index; N],
+    pub(crate) match_index: Vec<Index>,
 }
 
-impl<const N: usize> LeaderState<N> {
-    pub(crate) fn new(last_log_index: Index) -> Self {
+impl LeaderState {
+    pub(crate) fn new(last_log_index: Index, cluster_size: usize) -> Self {
         let next_index = NonZeroIndex::new(last_log_index + 1)
             .expect("adding one ensures that the result is non-zero");
         Self {
-            next_index: [next_index; N],
-            match_index: [0; N],
+            next_index: (0..cluster_size).map(|_| next_index).collect(),
+            match_index: (0..cluster_size).map(|_| 0).collect(),
         }
     }
 }

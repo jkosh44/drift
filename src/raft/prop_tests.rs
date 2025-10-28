@@ -16,7 +16,7 @@ struct Model {
     last_applied_index: Index,
 }
 
-impl<const N: usize> RaftCore<N, Cmd, TestStateMachine, TestStorage> {
+impl RaftCore<Cmd, TestStateMachine, TestStorage> {
     fn model(&self) -> Model {
         Model {
             last_term: *self.log_state.current_term(),
@@ -26,8 +26,8 @@ impl<const N: usize> RaftCore<N, Cmd, TestStateMachine, TestStorage> {
     }
 }
 
-fn check_invariants<const N: usize>(
-    node: &RaftCore<N, Cmd, TestStateMachine, TestStorage>,
+fn check_invariants(
+    node: &RaftCore<Cmd, TestStateMachine, TestStorage>,
     model: &Model,
 ) -> TestCaseResult {
     // Term monotonicity.
@@ -89,8 +89,8 @@ fn check_invariants<const N: usize>(
 }
 
 #[derive(Debug, Clone)]
-struct TestCase<const N: usize> {
-    node: RaftCore<N, Cmd, TestStateMachine, TestStorage>,
+struct TestCase {
+    node: RaftCore<Cmd, TestStateMachine, TestStorage>,
     messages: Vec<Message<Cmd>>,
 }
 
@@ -101,15 +101,18 @@ enum Message<C: Command> {
     BecomeCandidate,
 }
 
-impl<const N: usize> Arbitrary for TestCase<N> {
+impl Arbitrary for TestCase {
     type Parameters = ();
 
     fn arbitrary_with(_: Self::Parameters) -> Self::Strategy {
-        any::<RaftCore<N, Cmd, TestStateMachine, TestStorage>>()
+        any::<RaftCore<Cmd, TestStateMachine, TestStorage>>()
             .prop_flat_map(|node| {
                 let last_index = node.log_state.log().last_index();
-                let message =
-                    any_with::<Message<Cmd>>((N, last_index, *node.log_state.current_term()));
+                let message = any_with::<Message<Cmd>>((
+                    node.cluster_size,
+                    last_index,
+                    *node.log_state.current_term(),
+                ));
                 let messages = prop::collection::vec(message, 64);
 
                 (Just(node), messages)
@@ -121,7 +124,7 @@ impl<const N: usize> Arbitrary for TestCase<N> {
     type Strategy = BoxedStrategy<Self>;
 }
 
-impl<const N: usize, C, SM, S> Arbitrary for RaftCore<N, C, SM, S>
+impl<C, SM, S> Arbitrary for RaftCore<C, SM, S>
 where
     C: Command + Arbitrary + 'static,
     <C as Arbitrary>::Strategy: 'static,
@@ -131,20 +134,38 @@ where
     type Parameters = ();
 
     fn arbitrary_with(_: Self::Parameters) -> Self::Strategy {
-        (0..N, any_with::<LogState<C>>(N))
-            .prop_flat_map(|(node_id, log_state)| {
-                let node_state = any_with::<NodeState>((N, log_state.log().last_index()));
-                let role = any_with::<RoleState<N>>(log_state.log().last_index());
-                (Just(node_id as NodeId), Just(log_state), node_state, role)
+        // Limit cluster sizes to 15
+        (1_usize..15)
+            .prop_flat_map(|cluster_size| {
+                (
+                    Just(cluster_size),
+                    0..cluster_size,
+                    any_with::<LogState<C>>(cluster_size),
+                )
             })
-            .prop_map(|(node_id, log_state, node_state, role)| RaftCore {
-                node_id,
-                log_state,
-                node_state,
-                role,
-                state_machine: SM::default(),
-                storage: S::default(),
+            .prop_flat_map(|(cluster_size, node_id, log_state)| {
+                let node_state =
+                    any_with::<NodeState>((cluster_size, log_state.log().last_index()));
+                let role = any_with::<RoleState>((cluster_size, log_state.log().last_index()));
+                (
+                    Just(cluster_size),
+                    Just(node_id as NodeId),
+                    Just(log_state),
+                    node_state,
+                    role,
+                )
             })
+            .prop_map(
+                |(cluster_size, node_id, log_state, node_state, role)| RaftCore {
+                    node_id,
+                    cluster_size,
+                    log_state,
+                    node_state,
+                    role,
+                    state_machine: SM::default(),
+                    storage: S::default(),
+                },
+            )
             .boxed()
     }
 
@@ -229,14 +250,14 @@ impl Arbitrary for NodeState {
     type Strategy = BoxedStrategy<Self>;
 }
 
-impl<const N: usize> Arbitrary for RoleState<N> {
-    type Parameters = Index;
+impl Arbitrary for RoleState {
+    type Parameters = (usize, Index);
 
-    fn arbitrary_with(last_index: Self::Parameters) -> Self::Strategy {
+    fn arbitrary_with((cluster_size, last_index): Self::Parameters) -> Self::Strategy {
         prop_oneof![
             Just(RoleState::Follower),
-            (0..=(N / 2)).prop_map(|votes| RoleState::Candidate { votes }),
-            any_with::<LeaderState<N>>(last_index)
+            (0..=(cluster_size / 2)).prop_map(|votes| RoleState::Candidate { votes }),
+            any_with::<LeaderState>((cluster_size, last_index))
                 .prop_map(|leader_state| RoleState::Leader { leader_state }),
         ]
         .boxed()
@@ -245,25 +266,19 @@ impl<const N: usize> Arbitrary for RoleState<N> {
     type Strategy = BoxedStrategy<Self>;
 }
 
-impl<const N: usize> Arbitrary for LeaderState<N> {
-    type Parameters = Index;
+impl Arbitrary for LeaderState {
+    type Parameters = (usize, Index);
 
-    fn arbitrary_with(last_index: Self::Parameters) -> Self::Strategy {
+    fn arbitrary_with((cluster_size, last_index): Self::Parameters) -> Self::Strategy {
         (
-            prop::collection::vec(1..=(last_index + 1), N),
-            prop::collection::vec(0..=last_index, N),
+            prop::collection::vec(1..=(last_index + 1), cluster_size),
+            prop::collection::vec(0..=last_index, cluster_size),
         )
-            .prop_map(|(next_index_vec, match_index_vec)| {
-                let next_index_vec: Vec<_> = next_index_vec
+            .prop_map(|(next_index, match_index)| {
+                let next_index = next_index
                     .into_iter()
                     .map(|index| NonZeroIndex::new(index).unwrap())
                     .collect();
-                let mut next_index = [NonZeroIndex::new(1).unwrap(); N];
-                next_index.copy_from_slice(&next_index_vec);
-
-                let mut match_index = [0; N];
-                match_index.copy_from_slice(&match_index_vec);
-
                 LeaderState {
                     next_index,
                     match_index,
@@ -474,7 +489,7 @@ fn any_message_term_with(current_term: Term) -> BoxedStrategy<Term> {
 
 proptest! {
     #[test]
-    fn raft_single_node_state_machine(TestCase {mut node, messages } in any::<TestCase<3>>()) {
+    fn raft_single_node_state_machine(TestCase {mut node, messages } in any::<TestCase>()) {
         // Check invariants at the beginning to make sure the test is valid.
         check_invariants(&node, &node.model())?;
 
